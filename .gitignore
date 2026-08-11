@@ -1,0 +1,12 @@
+node_modules/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+.env
+uploads/avatars/*
+!uploads/avatars/.gitkeep
+*.log
+
+# 临时调试脚本(含本地硬编码路径,不入库)
+probe.js
+probe2.js

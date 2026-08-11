@@ -1,0 +1,26 @@
+{
+  "name": "customerbackend-node",
+  "version": "1.0.0",
+  "description": "客户管理系统 API（Node.js 版，迁移自 Python FastAPI）",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "migrate": "node scripts/migrate-from-mysql.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "mysql2": "^3.11.5",
+    "nodemon": "^3.1.9"
+  }
+}
