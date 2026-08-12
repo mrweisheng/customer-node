@@ -52,6 +52,25 @@ function normalizeAmount(v) {
   return n;
 }
 
+// 智能日期解析（用于「日期/名字」精准搜索）
+// "0503"(4位月日) → 跨年模糊匹配该月日；"60503"(5位=年份末位+月日) → 就近年份精确匹配
+// 返回 { sql, params } 或 null（非 4~5 位数字）
+function parseSmartDate(datePart) {
+  if (!/^\d{4,5}$/.test(datePart)) return null;
+  const mm = datePart.slice(-4, -2);
+  const dd = datePart.slice(-2);
+  if (datePart.length === 4) {
+    // 月日：不限年份，匹配任意年的该月日
+    return { sql: ' AND substr(lead_date,6,2)=? AND substr(lead_date,9,2)=?', params: [mm, dd] };
+  }
+  // 5 位：首位为年份末位，取就近（≤当前年）的年份，精确到年月日
+  const yLast = parseInt(datePart[0], 10);
+  const currYear = new Date().getFullYear();
+  const currLast = currYear % 10;
+  const year = currYear - (((currLast - yLast) + 10) % 10);
+  return { sql: ' AND lead_date=?', params: [`${year}-${mm}-${dd}`] };
+}
+
 // ── GET /stats ─────────────────────────────────────────
 router.get('/stats', authRequired, (req, res, next) => {
   try {
@@ -202,13 +221,27 @@ router.get('/search', authRequired, (req, res, next) => {
     const targetUserId = optInt(req.query.target_user_id);
     const uf = buildUserFilter(req.user, targetUserId);
 
+    // 「日期/名字」精准搜索：含 / 时拆为日期+名字
+    //   4位(如 0503)=月日，跨年模糊；5位(如 60503)=年末位+月日，就近年份精确
+    //   日期部分无效时整体回退为纯名字模糊搜
+    let namePart = keyword;
+    let dateCond = null;
+    const slashIdx = keyword.indexOf('/');
+    if (slashIdx >= 0) {
+      const datePart = keyword.slice(0, slashIdx);
+      dateCond = parseSmartDate(datePart);
+      if (dateCond) namePart = keyword.slice(slashIdx + 1);
+    }
+
     // LIKE 转义（对齐 §6.5）：\ → \\, % → \%, _ → \_
-    const safe = keyword.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const safe = namePart.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const dateSql = dateCond ? dateCond.sql : '';
+    const dateParams = dateCond ? dateCond.params : [];
     const rows = db.prepare(
       `SELECT * FROM customers WHERE ${uf.clause}
-       AND customer_name LIKE ? ESCAPE '\\'
+       AND customer_name LIKE ? ESCAPE '\\'${dateSql}
        ORDER BY lead_date DESC, created_at DESC LIMIT 50`
-    ).all(...uf.params, `%${safe}%`);
+    ).all(...uf.params, `%${safe}%`, ...dateParams);
     res.json(rows.map(serializeCustomer));
   } catch (e) { next(e); }
 });
