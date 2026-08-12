@@ -5,7 +5,7 @@ const router = express.Router();
 const db = require('../db');
 const authRequired = require('../middleware/auth');
 const { httpError } = require('../middleware/errorHandler');
-const { serializeCustomer } = require('../utils/serialize');
+const { serializeCustomer, serializeDeal, serializeFollowup } = require('../utils/serialize');
 
 const pad = (n) => String(n).padStart(2, '0');
 const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -33,6 +33,23 @@ function optInt(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = parseInt(v, 10);
   return Number.isNaN(n) ? null : n;
+}
+
+// 取当前用户名下的客户（用于成交/跟进等写操作的归属校验）
+function getOwnedCustomer(customerId, userId) {
+  return db.prepare('SELECT * FROM customers WHERE id = ? AND user_id = ?').get(customerId, userId);
+}
+
+// 成交时间校验：合法 YYYY-MM-DD 返回原值，否则 null
+function normalizeDealTime(v) {
+  return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
+}
+// 金额校验：空值→null；数字→Number；非法→抛错
+function normalizeAmount(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (Number.isNaN(n)) throw httpError(422, 'amount 必须为数字');
+  return n;
 }
 
 // ── GET /stats ─────────────────────────────────────────
@@ -317,8 +334,17 @@ router.put('/:customer_id/priority', authRequired, (req, res, next) => {
     const customer = db.prepare('SELECT * FROM customers WHERE id = ? AND user_id = ?').get(customerId, req.user.id);
     if (!customer) return next(httpError(404, '客户不存在'));
 
-    db.prepare('UPDATE customers SET is_priority = ?, remark = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(is_priority ? 1 : 0, remark === undefined ? null : remark, customerId);
+    // 标注/取消重点：更新标记，备注非空时同时追加一条跟进历史（保证历史完整）
+    const remarkText = remark === undefined ? null : remark;
+    const tx = db.transaction(() => {
+      db.prepare('UPDATE customers SET is_priority = ?, remark = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(is_priority ? 1 : 0, remarkText, customerId);
+      if (remarkText && String(remarkText).trim()) {
+        db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+          .run(customerId, req.user.id, `${is_priority ? '标注重点' : '取消重点'}：${String(remarkText).trim()}`);
+      }
+    });
+    tx();
     res.json({ code: 0, msg: '更新成功' });
   } catch (e) { next(e); }
 });
@@ -335,9 +361,157 @@ router.put('/:customer_id/visit', authRequired, (req, res, next) => {
     const customer = db.prepare('SELECT * FROM customers WHERE id = ? AND user_id = ?').get(customerId, req.user.id);
     if (!customer) return next(httpError(404, '客户不存在'));
 
-    db.prepare('UPDATE customers SET remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(remark, customerId);
+    // 兼容旧接口：追加一条跟进历史 + 刷新 customers 缓存（小程序端不改也积累历史、不再丢失）
+    const tx = db.transaction(() => {
+      db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+        .run(customerId, req.user.id, remark);
+      db.prepare('UPDATE customers SET remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(remark, customerId);
+    });
+    tx();
     res.json({ code: 0, msg: '回访记录已保存' });
+  } catch (e) { next(e); }
+});
+
+// ── GET /:customer_id/followups ────────────────────────
+// 跟进/回访历史列表（追加式，最新在前）
+router.get('/:customer_id/followups', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const rows = db.prepare(
+      'SELECT * FROM customer_followups WHERE customer_id = ? ORDER BY created_at DESC, id DESC'
+    ).all(customerId);
+    res.json(rows.map(serializeFollowup));
+  } catch (e) { next(e); }
+});
+
+// ── POST /:customer_id/followups ───────────────────────
+// 追加一条跟进记录（INSERT 历史 + 刷新 customers.remark/last_visit_at 缓存）
+router.post('/:customer_id/followups', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const { content } = req.body || {};
+    if (!content || content.length < 1 || content.length > 2000) {
+      return next(httpError(422, 'content 长度需 1-2000 字符'));
+    }
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const tx = db.transaction(() => {
+      db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+        .run(customerId, req.user.id, content);
+      db.prepare('UPDATE customers SET remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(content, customerId);
+    });
+    tx();
+    res.json({ code: 0, msg: '跟进记录已保存' });
+  } catch (e) { next(e); }
+});
+
+// ── GET /:customer_id/deals ────────────────────────────
+// 成交记录列表（一客户可多条：车辆/两地牌各自独立）
+router.get('/:customer_id/deals', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const rows = db.prepare(
+      `SELECT * FROM customer_deals WHERE customer_id = ?
+       ORDER BY (deal_time IS NULL) ASC, deal_time DESC, created_at DESC, id DESC`
+    ).all(customerId);
+    res.json(rows.map(serializeDeal));
+  } catch (e) { next(e); }
+});
+
+// 成交字段校验（vehicle/plate 公用）
+function validateDealBody(b) {
+  const dealType = b.deal_type;
+  if (!['vehicle', 'plate'].includes(dealType)) {
+    throw httpError(422, "deal_type 必须为 'vehicle' 或 'plate'");
+  }
+  if (dealType === 'vehicle' && !(b.vin && String(b.vin).trim()) && !(b.vehicle_desc && String(b.vehicle_desc).trim())) {
+    throw httpError(422, '车辆成交需填写车架号或车辆描述');
+  }
+  if (dealType === 'plate' && !(b.port && String(b.port).trim())) {
+    throw httpError(422, '两地牌成交需选择口岸');
+  }
+  return {
+    deal_type: dealType,
+    deal_time: normalizeDealTime(b.deal_time),
+    amount: normalizeAmount(b.amount),
+    // 按 deal_type 只保留对应类型字段，另一类型字段强制清空，避免切换类型残留脏数据
+    vin: dealType === 'vehicle' ? (b.vin || null) : null,
+    vehicle_desc: dealType === 'vehicle' ? (b.vehicle_desc || null) : null,
+    port: dealType === 'plate' ? (b.port || null) : null,
+    plate_kind: dealType === 'plate' ? (b.plate_kind || null) : null,
+    plate_number: dealType === 'plate' ? (b.plate_number || null) : null,
+    remark: b.remark || null,
+  };
+}
+
+// ── POST /:customer_id/deals ───────────────────────────
+// 新增一条成交（车辆或两地牌）；成交后自动取消重点
+router.post('/:customer_id/deals', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const d = validateDealBody(req.body || {});
+    const tx = db.transaction(() => {
+      const info = db.prepare(
+        `INSERT INTO customer_deals
+         (customer_id, user_id, deal_type, deal_time, amount, vin, vehicle_desc, port, plate_kind, plate_number, remark)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(customerId, req.user.id, d.deal_type, d.deal_time, d.amount, d.vin, d.vehicle_desc,
+        d.port, d.plate_kind, d.plate_number, d.remark);
+      // 成交即转化：自动移出重点客户列表（历史成交与跟进仍保留可查）
+      db.prepare('UPDATE customers SET is_priority = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(customerId);
+      return info.lastInsertRowid;
+    });
+    const dealId = tx();
+    res.json({ code: 0, msg: '成交已记录，已自动移出重点列表', deal_id: dealId });
+  } catch (e) { next(e); }
+});
+
+// ── PUT /:customer_id/deals/:deal_id ───────────────────
+// 编辑某条成交
+router.put('/:customer_id/deals/:deal_id', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    const dealId = parseInt(req.params.deal_id, 10);
+    if (Number.isNaN(customerId) || Number.isNaN(dealId)) return next(httpError(422, 'id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const deal = db.prepare('SELECT * FROM customer_deals WHERE id = ? AND customer_id = ? AND user_id = ?')
+      .get(dealId, customerId, req.user.id);
+    if (!deal) return next(httpError(404, '成交记录不存在'));
+    const d = validateDealBody(req.body || {});
+    db.prepare(
+      `UPDATE customer_deals SET deal_type=?, deal_time=?, amount=?, vin=?, vehicle_desc=?, port=?, plate_kind=?, plate_number=?, remark=?, updated_at=CURRENT_TIMESTAMP WHERE id = ?`
+    ).run(d.deal_type, d.deal_time, d.amount, d.vin, d.vehicle_desc, d.port, d.plate_kind, d.plate_number, d.remark, dealId);
+    res.json({ code: 0, msg: '成交已更新' });
+  } catch (e) { next(e); }
+});
+
+// ── DELETE /:customer_id/deals/:deal_id ────────────────
+// 删除某条成交（不自动恢复重点，如需恢复请在面板手动标注）
+router.delete('/:customer_id/deals/:deal_id', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    const dealId = parseInt(req.params.deal_id, 10);
+    if (Number.isNaN(customerId) || Number.isNaN(dealId)) return next(httpError(422, 'id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const info = db.prepare('DELETE FROM customer_deals WHERE id = ? AND customer_id = ? AND user_id = ?')
+      .run(dealId, customerId, req.user.id);
+    if (info.changes === 0) return next(httpError(404, '成交记录不存在'));
+    res.json({ code: 0, msg: '成交已删除' });
   } catch (e) { next(e); }
 });
 

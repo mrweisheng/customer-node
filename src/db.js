@@ -45,6 +45,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_lead_name ON customers(user_id, lead_
 CREATE INDEX IF NOT EXISTS ix_customers_user_id ON customers(user_id);
 CREATE INDEX IF NOT EXISTS ix_customers_lead_date ON customers(lead_date);
 CREATE INDEX IF NOT EXISTS ix_customers_is_priority ON customers(is_priority);
+
+-- 成交记录（扁平单表：每条为一个成交项；既买车又办牌=两条；分次成交=不同 deal_time 两条）
+CREATE TABLE IF NOT EXISTS customer_deals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES customers(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  deal_type TEXT NOT NULL CHECK(deal_type IN ('vehicle','plate')),  -- 车辆 / 两地牌
+  deal_time TEXT,        -- 成交时间 YYYY-MM-DD
+  amount REAL,           -- 成交金额
+  -- 车辆成交专用(deal_type='vehicle')
+  vin TEXT,              -- 车架号
+  vehicle_desc TEXT,     -- 车辆描述(车型/颜色等,无 VIN 时填此项)
+  -- 两地牌专用(deal_type='plate')
+  port TEXT,             -- 口岸(深圳湾/莲塘/沙头角/港珠澳)
+  plate_kind TEXT,       -- 期牌 / 现牌
+  plate_number TEXT,     -- 车牌号码(仅现牌)
+  remark TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_deals_customer ON customer_deals(customer_id);
+CREATE INDEX IF NOT EXISTS idx_deals_user ON customer_deals(user_id);
+CREATE INDEX IF NOT EXISTS idx_deals_type ON customer_deals(deal_type);
+
+-- 跟进/回访历史（一客户多条，追加而非覆盖）
+CREATE TABLE IF NOT EXISTS customer_followups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES customers(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  content TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_followups_customer ON customer_followups(customer_id);
+CREATE INDEX IF NOT EXISTS idx_followups_user ON customer_followups(user_id);
 `);
 
 module.exports = db;

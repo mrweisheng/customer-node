@@ -40,4 +40,34 @@ function serializeCustomer(c) {
   };
 }
 
-module.exports = { formatDate, formatDateTime, serializeCustomer };
+// 成交记录行 → DealOut
+function serializeDeal(d) {
+  if (!d) return d;
+  return {
+    id: d.id,
+    customer_id: d.customer_id,
+    deal_type: d.deal_type,        // 'vehicle' | 'plate'
+    deal_time: formatDate(d.deal_time),
+    amount: d.amount === null || d.amount === undefined ? null : Number(d.amount),
+    vin: d.vin ?? null,
+    vehicle_desc: d.vehicle_desc ?? null,
+    port: d.port ?? null,
+    plate_kind: d.plate_kind ?? null,    // '期牌' | '现牌' | null
+    plate_number: d.plate_number ?? null,
+    remark: d.remark ?? null,
+    created_at: formatDateTime(d.created_at),
+  };
+}
+
+// 跟进记录行 → FollowupOut
+function serializeFollowup(f) {
+  if (!f) return f;
+  return {
+    id: f.id,
+    customer_id: f.customer_id,
+    content: f.content,
+    created_at: formatDateTime(f.created_at),
+  };
+}
+
+module.exports = { formatDate, formatDateTime, serializeCustomer, serializeDeal, serializeFollowup };
