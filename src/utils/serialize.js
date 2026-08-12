@@ -70,4 +70,19 @@ function serializeFollowup(f) {
   };
 }
 
-module.exports = { formatDate, formatDateTime, serializeCustomer, serializeDeal, serializeFollowup };
+// 到店记录行 → VisitOut
+function serializeVisit(v) {
+  if (!v) return v;
+  return {
+    id: v.id,
+    customer_id: v.customer_id,
+    visit_time: formatDate(v.visit_time),
+    needs: v.needs ?? null,
+    is_deal: !!v.is_deal,
+    deal_id: v.deal_id ?? null,
+    remark: v.remark ?? null,
+    created_at: formatDateTime(v.created_at),
+  };
+}
+
+module.exports = { formatDate, formatDateTime, serializeCustomer, serializeDeal, serializeFollowup, serializeVisit };

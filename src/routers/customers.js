@@ -5,7 +5,7 @@ const router = express.Router();
 const db = require('../db');
 const authRequired = require('../middleware/auth');
 const { httpError } = require('../middleware/errorHandler');
-const { serializeCustomer, serializeDeal, serializeFollowup } = require('../utils/serialize');
+const { serializeCustomer, serializeDeal, serializeFollowup, serializeVisit } = require('../utils/serialize');
 
 const pad = (n) => String(n).padStart(2, '0');
 const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -556,6 +556,128 @@ router.post('/:customer_id/followups', authRequired, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── GET /:customer_id/visits ───────────────────────────
+// 到店记录列表（一客户可多条，最新在前）
+router.get('/:customer_id/visits', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const rows = db.prepare(
+      `SELECT * FROM customer_visits WHERE customer_id = ?
+       ORDER BY (visit_time IS NULL) DESC, visit_time DESC, created_at DESC, id DESC`
+    ).all(customerId);
+    res.json(rows.map(serializeVisit));
+  } catch (e) { next(e); }
+});
+
+// ── POST /:customer_id/visits ──────────────────────────
+// 新增一条到店记录：
+//   未成交 → needs 必填，自动 is_priority=1，remark=needs（每次都刷新），追加跟进留痕
+//   已成交 → 可带 deal_payload 一次生成成交记录（复用 validateDealBody/insertDealRow），成交即移出重点
+router.post('/:customer_id/visits', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+
+    const b = req.body || {};
+    const visitTime = normalizeDealTime(b.visit_time) || ymd(new Date()); // 空或不合法→今天
+    const needs = b.needs != null ? String(b.needs).trim() : '';
+    const isDeal = !!b.is_deal;
+    const remark = b.remark != null ? String(b.remark).trim() || null : null;
+
+    // 未成交时需求必填
+    if (!isDeal && !needs) {
+      return next(httpError(422, '未成交时请填写需求'));
+    }
+
+    const insertVisit = db.prepare(
+      `INSERT INTO customer_visits
+       (customer_id, user_id, visit_time, needs, is_deal, deal_id, remark)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertFollowup = db.prepare(
+      'INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)'
+    );
+
+    const tx = db.transaction(() => {
+      let dealId = null;
+      if (isDeal) {
+        // 附带成交信息时生成成交记录（不附带则仅记录到店成交事件）
+        if (b.deal_payload && typeof b.deal_payload === 'object' && Object.keys(b.deal_payload).length) {
+          const d = validateDealBody(b.deal_payload);
+          dealId = insertDealRow(customerId, req.user.id, d);
+        }
+        const info = insertVisit.run(customerId, req.user.id, visitTime, needs || null, 1, dealId, remark);
+        // 成交即转化：移出重点；到店视作一次接触，刷新 last_visit_at
+        db.prepare('UPDATE customers SET is_priority = 0, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .run(customerId);
+        insertFollowup.run(customerId, req.user.id, `到店成交${needs ? '：' + needs : ''}`);
+        return info.lastInsertRowid;
+      }
+      // 未成交：自动标重点 + 刷新备注为需求
+      const info = insertVisit.run(customerId, req.user.id, visitTime, needs, 0, null, remark);
+      db.prepare('UPDATE customers SET is_priority = 1, remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(needs, customerId);
+      insertFollowup.run(customerId, req.user.id, `到店未成交：${needs}`);
+      return info.lastInsertRowid;
+    });
+    const visitId = tx();
+    res.json({
+      code: 0,
+      msg: isDeal ? '到店已记录，已生成成交并移出重点列表' : '到店已记录，已自动标为重点客户',
+      visit_id: visitId,
+    });
+  } catch (e) { next(e); }
+});
+
+// ── PUT /:customer_id/visits/:visit_id ─────────────────
+// 编辑某条到店记录（不联动重点状态，避免副作用；如需改重点请走 /priority）
+router.put('/:customer_id/visits/:visit_id', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    const visitId = parseInt(req.params.visit_id, 10);
+    if (Number.isNaN(customerId) || Number.isNaN(visitId)) return next(httpError(422, 'id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const visit = db.prepare('SELECT * FROM customer_visits WHERE id = ? AND customer_id = ? AND user_id = ?')
+      .get(visitId, customerId, req.user.id);
+    if (!visit) return next(httpError(404, '到店记录不存在'));
+
+    const b = req.body || {};
+    const visitTime = normalizeDealTime(b.visit_time) || ymd(new Date());
+    const needs = b.needs != null ? String(b.needs).trim() || null : null;
+    const isDeal = b.is_deal !== undefined ? (!!b.is_deal ? 1 : 0) : visit.is_deal;
+    const remark = b.remark != null ? String(b.remark).trim() || null : null;
+    // 未成交时需求必填
+    if (!isDeal && !needs) return next(httpError(422, '未成交时请填写需求'));
+
+    db.prepare(
+      `UPDATE customer_visits SET visit_time=?, needs=?, is_deal=?, remark=?, updated_at=CURRENT_TIMESTAMP WHERE id = ?`
+    ).run(visitTime, needs, isDeal, remark, visitId);
+    res.json({ code: 0, msg: '到店记录已更新' });
+  } catch (e) { next(e); }
+});
+
+// ── DELETE /:customer_id/visits/:visit_id ──────────────
+// 删除某条到店记录（不连带删除关联的成交记录）
+router.delete('/:customer_id/visits/:visit_id', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    const visitId = parseInt(req.params.visit_id, 10);
+    if (Number.isNaN(customerId) || Number.isNaN(visitId)) return next(httpError(422, 'id 必须是整数'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const info = db.prepare('DELETE FROM customer_visits WHERE id = ? AND customer_id = ? AND user_id = ?')
+      .run(visitId, customerId, req.user.id);
+    if (info.changes === 0) return next(httpError(404, '到店记录不存在'));
+    res.json({ code: 0, msg: '到店记录已删除' });
+  } catch (e) { next(e); }
+});
+
 // ── GET /:customer_id/deals ────────────────────────────
 // 成交记录列表（一客户可多条：车辆/两地牌各自独立）
 router.get('/:customer_id/deals', authRequired, (req, res, next) => {
@@ -598,6 +720,17 @@ function validateDealBody(b) {
   };
 }
 
+// 插入一条成交记录，返回新 deal_id（POST /deals 与 POST /visits 成交联动共用）
+function insertDealRow(customerId, userId, d) {
+  const info = db.prepare(
+    `INSERT INTO customer_deals
+     (customer_id, user_id, deal_type, deal_time, amount, vin, vehicle_desc, port, plate_kind, plate_number, remark)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(customerId, userId, d.deal_type, d.deal_time, d.amount, d.vin, d.vehicle_desc,
+    d.port, d.plate_kind, d.plate_number, d.remark);
+  return info.lastInsertRowid;
+}
+
 // ── POST /:customer_id/deals ───────────────────────────
 // 新增一条成交（车辆或两地牌）；成交后自动取消重点
 router.post('/:customer_id/deals', authRequired, (req, res, next) => {
@@ -608,16 +741,11 @@ router.post('/:customer_id/deals', authRequired, (req, res, next) => {
     if (!customer) return next(httpError(404, '客户不存在'));
     const d = validateDealBody(req.body || {});
     const tx = db.transaction(() => {
-      const info = db.prepare(
-        `INSERT INTO customer_deals
-         (customer_id, user_id, deal_type, deal_time, amount, vin, vehicle_desc, port, plate_kind, plate_number, remark)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(customerId, req.user.id, d.deal_type, d.deal_time, d.amount, d.vin, d.vehicle_desc,
-        d.port, d.plate_kind, d.plate_number, d.remark);
+      const dealId = insertDealRow(customerId, req.user.id, d);
       // 成交即转化：自动移出重点客户列表（历史成交与跟进仍保留可查）
       db.prepare('UPDATE customers SET is_priority = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(customerId);
-      return info.lastInsertRowid;
+      return dealId;
     });
     const dealId = tx();
     res.json({ code: 0, msg: '成交已记录，已自动移出重点列表', deal_id: dealId });

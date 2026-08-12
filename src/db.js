@@ -79,6 +79,24 @@ CREATE TABLE IF NOT EXISTS customer_followups (
 );
 CREATE INDEX IF NOT EXISTS idx_followups_customer ON customer_followups(customer_id);
 CREATE INDEX IF NOT EXISTS idx_followups_user ON customer_followups(user_id);
+
+-- 到店记录（客户到店事件，与跟进/回访分开）
+-- 未成交：写清需求，自动标重点；已成交：可同时生成成交记录并通过 deal_id 关联
+CREATE TABLE IF NOT EXISTS customer_visits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES customers(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  visit_time TEXT,          -- 到店时间 YYYY-MM-DD（默认今天）
+  needs TEXT,               -- 需求（未成交时必填）
+  is_deal INTEGER DEFAULT 0,-- 是否成交 0/1
+  deal_id INTEGER,          -- 成交时关联的 customer_deals.id（不加 FK，便于成交独立删除）
+  remark TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_visits_customer ON customer_visits(customer_id);
+CREATE INDEX IF NOT EXISTS idx_visits_user ON customer_visits(user_id);
+CREATE INDEX IF NOT EXISTS idx_visits_is_deal ON customer_visits(is_deal);
 `);
 
 module.exports = db;
