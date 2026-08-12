@@ -358,6 +358,87 @@ router.get('/users/list', authRequired, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── GET /deal-stats ────────────────────────────────────
+// 成交统计：总览(客户数/单数，不含金额) + 近6月单数趋势 + 口岸分布 + 期现牌 + 最近10条
+router.get('/deal-stats', authRequired, (req, res, next) => {
+  try {
+    const targetUserId = optInt(req.query.target_user_id);
+    const uf = buildUserFilter(req.user, targetUserId);
+    const clause = uf.clause;   // customer_deals 表自带 user_id，可直接套用
+
+    // 总览：成交单数、成交客户数(去重)、车辆/两地牌单数
+    const ov = db.prepare(
+      `SELECT COUNT(*) AS total_count,
+              COUNT(DISTINCT customer_id) AS customer_count,
+              SUM(CASE WHEN deal_type='vehicle' THEN 1 ELSE 0 END) AS vehicle_count,
+              SUM(CASE WHEN deal_type='plate' THEN 1 ELSE 0 END) AS plate_count
+       FROM customer_deals WHERE ${clause}`
+    ).get(...uf.params);
+
+    // 本月（按 deal_time）
+    const today = new Date();
+    const monthStart = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-01`;
+    const m = db.prepare(
+      `SELECT COUNT(*) AS c
+       FROM customer_deals WHERE ${clause} AND deal_time >= ?`
+    ).get(...uf.params, monthStart);
+
+    // 近 6 个月成交单数趋势
+    const months = [], counts = [];
+    for (let i = 5; i >= 0; i--) {
+      let year = today.getFullYear();
+      let month = today.getMonth() + 1 - i;
+      while (month <= 0) { year -= 1; month += 12; }
+      const start = `${year}-${pad(month)}-01`;
+      const end = `${year}-${pad(month)}-${pad(monthDays(year, month))}`;
+      const row = db.prepare(
+        `SELECT COUNT(*) AS c
+         FROM customer_deals WHERE ${clause} AND deal_time >= ? AND deal_time <= ?`
+      ).get(...uf.params, start, end);
+      months.push(`${year}-${pad(month)}`);
+      counts.push(row.c);
+    }
+
+    // 两地牌口岸分布
+    const portRows = db.prepare(
+      `SELECT port, COUNT(*) AS c FROM customer_deals
+       WHERE ${clause} AND deal_type='plate' AND port IS NOT NULL GROUP BY port`
+    ).all(...uf.params);
+    const by_port = {};
+    for (const r of portRows) by_port[r.port] = r.c;
+
+    // 期牌/现牌
+    const kindRows = db.prepare(
+      `SELECT plate_kind, COUNT(*) AS c FROM customer_deals
+       WHERE ${clause} AND deal_type='plate' AND plate_kind IS NOT NULL GROUP BY plate_kind`
+    ).all(...uf.params);
+    const by_plate_kind = {};
+    for (const r of kindRows) by_plate_kind[r.plate_kind] = r.c;
+
+    // 最近 10 条成交（JOIN 客户名；deals 起别名 d，避免与 customers.user_id 列名冲突）
+    const dealClause = clause.replace('user_id', 'd.user_id');
+    const recent = db.prepare(
+      `SELECT d.id, d.customer_id, d.deal_type, d.amount, d.deal_time, d.created_at,
+              d.vin, d.vehicle_desc, d.port, d.plate_kind, d.plate_number, d.remark,
+              c.customer_name
+       FROM customer_deals d LEFT JOIN customers c ON c.id = d.customer_id
+       WHERE ${dealClause} ORDER BY d.created_at DESC LIMIT 10`
+    ).all(...uf.params);
+
+    res.json({
+      total_count: ov.total_count,
+      customer_count: ov.customer_count,
+      vehicle_count: ov.vehicle_count || 0,
+      plate_count: ov.plate_count || 0,
+      month_count: m.c,
+      monthly: { months, counts },
+      by_port,
+      by_plate_kind,
+      recent: recent.map((d) => ({ ...serializeDeal(d), customer_name: d.customer_name })),
+    });
+  } catch (e) { next(e); }
+});
+
 // ── PUT /:customer_id/priority ─────────────────────────
 router.put('/:customer_id/priority', authRequired, (req, res, next) => {
   try {
