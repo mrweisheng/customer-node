@@ -9,6 +9,10 @@ const morgan = require('morgan');
 const config = require('./config');
 // 引入 db 即触发建表 DDL（幂等）
 require('./db');
+// 启动时自动补录：有成交但无到店的客户，按最新成交日补一条到店（幂等）
+const backfillVisits = require('./utils/backfillVisits');
+const backfilled = backfillVisits();
+if (backfilled > 0) console.log(`[backfill] 已为 ${backfilled} 位历史成交客户补录到店记录`);
 const blockScan = require('./middleware/blockScan');
 const { MALICIOUS_PATTERNS } = require('./middleware/blockScan');
 const { errorHandler } = require('./middleware/errorHandler');

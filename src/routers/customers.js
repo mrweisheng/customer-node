@@ -488,8 +488,12 @@ router.get('/visit-list', authRequired, (req, res, next) => {
     const end = `${year}-${pad(month)}-${pad(monthDays(year, month))}`;
     const visitClause = uf.clause.replace('user_id', 'v.user_id');
     const rows = db.prepare(
-      `SELECT v.*, c.customer_name, c.lead_date
-       FROM customer_visits v LEFT JOIN customers c ON c.id = v.customer_id
+      `SELECT v.*, c.customer_name, c.lead_date,
+              d.deal_type AS d_deal_type, d.vehicle_desc AS d_vehicle_desc,
+              d.port AS d_port, d.plate_kind AS d_plate_kind
+       FROM customer_visits v
+       LEFT JOIN customers c ON c.id = v.customer_id
+       LEFT JOIN customer_deals d ON d.id = v.deal_id
        WHERE ${visitClause} AND v.visit_time >= ? AND v.visit_time <= ?
        ORDER BY v.visit_time DESC, v.created_at DESC`
     ).all(...uf.params, start, end);
@@ -497,6 +501,11 @@ router.get('/visit-list', authRequired, (req, res, next) => {
       ...serializeVisit(v),
       customer_name: v.customer_name,
       lead_date: v.lead_date ? String(v.lead_date).slice(0, 10) : null,
+      // 关联成交摘要（已成交到店展示用）
+      deal_type: v.d_deal_type ?? null,
+      vehicle_desc: v.d_vehicle_desc ?? null,
+      port: v.d_port ?? null,
+      plate_kind: v.d_plate_kind ?? null,
     })));
   } catch (e) { next(e); }
 });
@@ -604,9 +613,8 @@ router.get('/:customer_id/visits', authRequired, (req, res, next) => {
 });
 
 // ── POST /:customer_id/visits ──────────────────────────
-// 新增一条到店记录：
-//   未成交 → needs 必填，自动 is_priority=1，remark=needs（每次都刷新），追加跟进留痕
-//   已成交 → 可带 deal_payload 一次生成成交记录（复用 validateDealBody/insertDealRow），成交即移出重点
+// 录入一条到店记录（仅「未成交」：成交到店由 POST /deals 自动生成，不在此录入）
+//   needs 必填 → 自动 is_priority=1，remark=needs（每次都刷新），追加跟进留痕
 router.post('/:customer_id/visits', authRequired, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
@@ -617,56 +625,28 @@ router.post('/:customer_id/visits', authRequired, (req, res, next) => {
     const b = req.body || {};
     const visitTime = normalizeDealTime(b.visit_time) || ymd(new Date()); // 空或不合法→今天
     const needs = b.needs != null ? String(b.needs).trim() : '';
-    const isDeal = !!b.is_deal;
     const remark = b.remark != null ? String(b.remark).trim() || null : null;
-
-    // 未成交时需求必填
-    if (!isDeal && !needs) {
-      return next(httpError(422, '未成交时请填写需求'));
-    }
-
-    const insertVisit = db.prepare(
-      `INSERT INTO customer_visits
-       (customer_id, user_id, visit_time, needs, is_deal, deal_id, remark)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    );
-    const insertFollowup = db.prepare(
-      'INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)'
-    );
+    if (!needs) return next(httpError(422, '请填写需求'));
 
     const tx = db.transaction(() => {
-      let dealId = null;
-      if (isDeal) {
-        // 附带成交信息时生成成交记录（不附带则仅记录到店成交事件）
-        if (b.deal_payload && typeof b.deal_payload === 'object' && Object.keys(b.deal_payload).length) {
-          const d = validateDealBody(b.deal_payload);
-          dealId = insertDealRow(customerId, req.user.id, d);
-        }
-        const info = insertVisit.run(customerId, req.user.id, visitTime, needs || null, 1, dealId, remark);
-        // 成交即转化：移出重点；到店视作一次接触，刷新 last_visit_at
-        db.prepare('UPDATE customers SET is_priority = 0, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-          .run(customerId);
-        insertFollowup.run(customerId, req.user.id, `到店成交${needs ? '：' + needs : ''}`);
-        return info.lastInsertRowid;
-      }
-      // 未成交：自动标重点 + 刷新备注为需求
-      const info = insertVisit.run(customerId, req.user.id, visitTime, needs, 0, null, remark);
+      const info = db.prepare(
+        `INSERT INTO customer_visits (customer_id, user_id, visit_time, needs, is_deal, deal_id, remark)
+         VALUES (?, ?, ?, ?, 0, NULL, ?)`
+      ).run(customerId, req.user.id, visitTime, needs, remark);
+      // 未成交：自动标重点 + 刷新备注为需求；到店视作一次接触，刷新 last_visit_at
       db.prepare('UPDATE customers SET is_priority = 1, remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(needs, customerId);
-      insertFollowup.run(customerId, req.user.id, `到店未成交：${needs}`);
+      db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+        .run(customerId, req.user.id, `到店未成交：${needs}`);
       return info.lastInsertRowid;
     });
     const visitId = tx();
-    res.json({
-      code: 0,
-      msg: isDeal ? '到店已记录，已生成成交并移出重点列表' : '到店已记录，已自动标为重点客户',
-      visit_id: visitId,
-    });
+    res.json({ code: 0, msg: '到店已记录，已自动标为重点客户', visit_id: visitId });
   } catch (e) { next(e); }
 });
 
 // ── PUT /:customer_id/visits/:visit_id ─────────────────
-// 编辑某条到店记录（不联动重点状态，避免副作用；如需改重点请走 /priority）
+// 编辑某条到店记录（仅改到店日/需求/备注；is_deal 与 deal_id 由成交联动管理，此处不变）
 router.put('/:customer_id/visits/:visit_id', authRequired, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
@@ -681,14 +661,13 @@ router.put('/:customer_id/visits/:visit_id', authRequired, (req, res, next) => {
     const b = req.body || {};
     const visitTime = normalizeDealTime(b.visit_time) || ymd(new Date());
     const needs = b.needs != null ? String(b.needs).trim() || null : null;
-    const isDeal = b.is_deal !== undefined ? (!!b.is_deal ? 1 : 0) : visit.is_deal;
     const remark = b.remark != null ? String(b.remark).trim() || null : null;
-    // 未成交时需求必填
-    if (!isDeal && !needs) return next(httpError(422, '未成交时请填写需求'));
+    // 未成交到店需求必填（已成交的可不填）
+    if (!visit.is_deal && !needs) return next(httpError(422, '未成交时请填写需求'));
 
     db.prepare(
-      `UPDATE customer_visits SET visit_time=?, needs=?, is_deal=?, remark=?, updated_at=CURRENT_TIMESTAMP WHERE id = ?`
-    ).run(visitTime, needs, isDeal, remark, visitId);
+      `UPDATE customer_visits SET visit_time=?, needs=?, remark=?, updated_at=CURRENT_TIMESTAMP WHERE id = ?`
+    ).run(visitTime, needs, remark, visitId);
     res.json({ code: 0, msg: '到店记录已更新' });
   } catch (e) { next(e); }
 });
@@ -763,7 +742,7 @@ function insertDealRow(customerId, userId, d) {
 }
 
 // ── POST /:customer_id/deals ───────────────────────────
-// 新增一条成交（车辆或两地牌）；成交后自动取消重点
+// 新增一条成交（车辆或两地牌）；成交即到店：自动生成到店记录；成交即转化：自动取消重点
 router.post('/:customer_id/deals', authRequired, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
@@ -771,15 +750,26 @@ router.post('/:customer_id/deals', authRequired, (req, res, next) => {
     const customer = getOwnedCustomer(customerId, req.user.id);
     if (!customer) return next(httpError(404, '客户不存在'));
     const d = validateDealBody(req.body || {});
+    const dealTime = d.deal_time || ymd(new Date());
     const tx = db.transaction(() => {
       const dealId = insertDealRow(customerId, req.user.id, d);
-      // 成交即转化：自动移出重点客户列表（历史成交与跟进仍保留可查）
-      db.prepare('UPDATE customers SET is_priority = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      // 成交即到店：自动生成一条到店记录并关联本次成交
+      // （同客户同日已存在成交到店则复用，避免「车+牌」一次到店被重复计数）
+      const existVisit = db.prepare(
+        'SELECT id FROM customer_visits WHERE customer_id = ? AND visit_time = ? AND is_deal = 1'
+      ).get(customerId, dealTime);
+      if (!existVisit) {
+        db.prepare(
+          'INSERT INTO customer_visits (customer_id, user_id, visit_time, needs, is_deal, deal_id) VALUES (?,?,?,?,?,?)'
+        ).run(customerId, req.user.id, dealTime, null, 1, dealId);
+      }
+      // 成交即转化：自动移出重点客户列表（历史成交与跟进仍保留可查）；到店视作一次接触，刷新 last_visit_at
+      db.prepare('UPDATE customers SET is_priority = 0, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(customerId);
       return dealId;
     });
     const dealId = tx();
-    res.json({ code: 0, msg: '成交已记录，已自动移出重点列表', deal_id: dealId });
+    res.json({ code: 0, msg: '成交已记录，已自动登记到店并移出重点列表', deal_id: dealId });
   } catch (e) { next(e); }
 });
 
