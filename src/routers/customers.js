@@ -470,6 +470,37 @@ router.get('/deal-list', authRequired, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── GET /visit-list ────────────────────────────────────
+// 某月到店列表（默认本月，带客户信息），用于重点页"本月到店"展示
+router.get('/visit-list', authRequired, (req, res, next) => {
+  try {
+    const targetUserId = optInt(req.query.target_user_id);
+    const uf = buildUserFilter(req.user, targetUserId);
+    const today = new Date();
+    let year = today.getFullYear();
+    let month = today.getMonth() + 1;
+    if (req.query.month && /^\d{4}-\d{2}$/.test(req.query.month)) {
+      const parts = req.query.month.split('-');
+      year = parseInt(parts[0], 10);
+      month = parseInt(parts[1], 10);
+    }
+    const start = `${year}-${pad(month)}-01`;
+    const end = `${year}-${pad(month)}-${pad(monthDays(year, month))}`;
+    const visitClause = uf.clause.replace('user_id', 'v.user_id');
+    const rows = db.prepare(
+      `SELECT v.*, c.customer_name, c.lead_date
+       FROM customer_visits v LEFT JOIN customers c ON c.id = v.customer_id
+       WHERE ${visitClause} AND v.visit_time >= ? AND v.visit_time <= ?
+       ORDER BY v.visit_time DESC, v.created_at DESC`
+    ).all(...uf.params, start, end);
+    res.json(rows.map((v) => ({
+      ...serializeVisit(v),
+      customer_name: v.customer_name,
+      lead_date: v.lead_date ? String(v.lead_date).slice(0, 10) : null,
+    })));
+  } catch (e) { next(e); }
+});
+
 // ── PUT /:customer_id/priority ─────────────────────────
 router.put('/:customer_id/priority', authRequired, (req, res, next) => {
   try {
