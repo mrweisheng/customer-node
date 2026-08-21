@@ -520,10 +520,14 @@ router.put('/:customer_id/priority', authRequired, (req, res, next) => {
     if (!customer) return next(httpError(404, '客户不存在'));
 
     // 标注/取消重点：更新标记，备注非空时同时追加一条跟进历史（保证历史完整）
+    // 标注重点时把 last_visit_at 重置为当前时间，作为"最近接触时间"起点，
+    // 让"待回访"状态从标重点那一刻开始算 7 天绿、30 天黄、超期红（与到店路径对齐）
     const remarkText = remark === undefined ? null : remark;
+    const setLastVisit = is_priority ? ', last_visit_at = CURRENT_TIMESTAMP' : '';
     const tx = db.transaction(() => {
-      db.prepare('UPDATE customers SET is_priority = ?, remark = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(is_priority ? 1 : 0, remarkText, customerId);
+      db.prepare(
+        `UPDATE customers SET is_priority = ?, remark = ?${setLastVisit}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+      ).run(is_priority ? 1 : 0, remarkText, customerId);
       if (remarkText && String(remarkText).trim()) {
         db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
           .run(customerId, req.user.id, `${is_priority ? '标注重点' : '取消重点'}：${String(remarkText).trim()}`);
