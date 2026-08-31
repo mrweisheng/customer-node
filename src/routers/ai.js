@@ -218,4 +218,55 @@ router.post('/batch-import', authRequired, (req, res, next) => {
   res.json({ added, updated, skipped, skipped_names: skippedNames });
 });
 
+// ── GET /daily-quote ───────────────────────────────────
+// 每日激励语：复用 SiliconFlow 生成，按 YYYY-MM-DD 内存缓存，全员所有用户复用同一句
+const dailyQuoteCache = new Map(); // dateKey -> quote
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+router.get('/daily-quote', async (req, res, next) => {
+  try {
+    const dateKey = todayKey();
+    if (dailyQuoteCache.has(dateKey)) {
+      return res.json({ quote: dailyQuoteCache.get(dateKey), cached: true });
+    }
+
+    const messages = [
+      {
+        role: 'system',
+        content: '你是一家香港车辆销售公司（含中港两地牌业务）的资深销售经理，每天为团队写一句简短的工作格言。',
+      },
+      {
+        role: 'user',
+        content:
+          '请写一句今日激励语。要求：\n' +
+          '1. 主题围绕：汽车销售 / 中港两地牌业务 / 客户跟进 / 成交转化 / 销售日常\n' +
+          '2. 不超过 18 个汉字\n' +
+          '3. 简洁、积极、专业\n' +
+          '4. 不要引号、句号、表情、emoji、客户姓名\n' +
+          '5. 港式中文或简体中文皆可\n\n' +
+          '只输出这一句话，不要任何解释。',
+      },
+    ];
+
+    let quote = await callSiliconflow(messages, { maxTokens: 80, extraParams: { temperature: 0.9 } });
+    // 清理：去引号 / 去末尾标点 / 去多余空白
+    quote = String(quote || '')
+      .replace(/["'`「」『』]/g, '')
+      .replace(/[。.,，！？!?；;：:\s]+$/g, '')
+      .trim();
+    // 兜底：模型偶发超长时截断；空结果报错走兜底
+    if (!quote) throw new Error('生成结果为空');
+    if (quote.length > 30) quote = quote.slice(0, 30);
+
+    dailyQuoteCache.set(dateKey, quote);
+    return res.json({ quote, cached: false });
+  } catch (e) {
+    return next(e);
+  }
+});
+
 module.exports = router;
