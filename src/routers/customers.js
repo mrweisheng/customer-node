@@ -510,6 +510,33 @@ router.get('/visit-list', authRequired, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── PUT /:customer_id/needs ────────────────────────────
+// 更新客户"当前需求"（客户级字段）；followup=true 时同步追加一条跟进留痕
+router.put('/:customer_id/needs', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const { needs, followup } = req.body || {};
+    if (needs === undefined || needs === null || String(needs).length < 1 || String(needs).length > 2000) {
+      return next(httpError(422, 'needs 长度需 1-2000 字符'));
+    }
+    const needsText = String(needs).trim();
+    if (!needsText) return next(httpError(422, 'needs 不能为空'));
+    const customer = getOwnedCustomer(customerId, req.user.id);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    const tx = db.transaction(() => {
+      db.prepare('UPDATE customers SET current_needs = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(needsText, customerId);
+      if (followup) {
+        db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+          .run(customerId, req.user.id, `更新需求：${needsText}`);
+      }
+    });
+    tx();
+    res.json({ code: 0, msg: '需求已更新' });
+  } catch (e) { next(e); }
+});
+
 // ── PUT /:customer_id/priority ─────────────────────────
 router.put('/:customer_id/priority', authRequired, (req, res, next) => {
   try {

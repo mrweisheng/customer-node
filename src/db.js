@@ -99,4 +99,12 @@ CREATE INDEX IF NOT EXISTS idx_visits_user ON customer_visits(user_id);
 CREATE INDEX IF NOT EXISTS idx_visits_is_deal ON customer_visits(is_deal);
 `);
 
+// ── 幂等迁移：customers.current_needs（客户级"当前需求"）──────────
+// 原需求挂在 customer_visits.needs 上，更新需求需重走到店表单；
+// v2 重构将"当前需求"上提为客户字段，重点跟进时可一键更新
+const customerCols = db.pragma('table_info(customers)');
+if (!customerCols.some((c) => c.name === 'current_needs')) {
+  db.exec('ALTER TABLE customers ADD COLUMN current_needs TEXT');
+}
+
 module.exports = db;

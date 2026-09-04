@@ -35,6 +35,7 @@ function serializeCustomer(c) {
     customer_name: c.customer_name,
     is_priority: !!c.is_priority,
     remark: (c.remark === null || c.remark === undefined) ? null : c.remark,
+    current_needs: c.current_needs ?? null,
     last_visit_at: formatDateTime(c.last_visit_at),
     created_at: formatDateTime(c.created_at),
   };

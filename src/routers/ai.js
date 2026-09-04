@@ -218,6 +218,48 @@ router.post('/batch-import', authRequired, (req, res, next) => {
   res.json({ added, updated, skipped, skipped_names: skippedNames });
 });
 
+// ── POST /check-duplicates ─────────────────────────────
+// 导入前批量查重：入参与 batch-import 相同（MMDD/YMMDD + 姓名），
+// 匹配逻辑与 batch-import 完全一致（同 user + 同解析后 lead_date + 同名即视为存在）
+router.post('/check-duplicates', authRequired, (req, res, next) => {
+  const contacts = (req.body || {}).contacts;
+  if (!Array.isArray(contacts) || contacts.length > 200) {
+    return next(httpError(422, 'contacts 必须是数组且不超过 200 条'));
+  }
+
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const currentYear = today.getFullYear();
+  const parsed = [];
+  for (const c of contacts) {
+    let d;
+    try { d = validateContactDate(c.date); } catch (e) { return next(httpError(422, e.message)); }
+    const month = parseInt(d.slice(0, 2), 10);
+    const day = parseInt(d.slice(2), 10);
+    let leadDate = new Date(currentYear, month - 1, day);
+    if (leadDate > today) leadDate = new Date(currentYear - 1, month - 1, day);
+    parsed.push({
+      date: d,
+      name: String(c.name || ''),
+      lead: `${leadDate.getFullYear()}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+    });
+  }
+
+  if (!parsed.length) return res.json({ results: [] });
+
+  const leadDates = [...new Set(parsed.map((p) => p.lead))];
+  const names = [...new Set(parsed.map((p) => p.name))];
+  const placeholdersD = leadDates.map(() => '?').join(',');
+  const placeholdersN = names.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT lead_date, customer_name FROM customers WHERE user_id = ? AND lead_date IN (${placeholdersD}) AND customer_name IN (${placeholdersN})`
+  ).all(req.user.id, ...leadDates, ...names);
+  const existSet = new Set(rows.map((r) => `${r.lead_date}|${r.customer_name}`));
+
+  res.json({
+    results: parsed.map((p) => ({ date: p.date, name: p.name, exists: existSet.has(`${p.lead}|${p.name}`) })),
+  });
+});
+
 // ── GET /daily-quote ───────────────────────────────────
 // 每日激励语：复用 SiliconFlow 生成，按 YYYY-MM-DD 内存缓存，全员所有用户复用同一句
 const dailyQuoteCache = new Map(); // dateKey -> quote
