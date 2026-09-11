@@ -92,7 +92,11 @@ router.post('/chat', authRequired, async (req, res, next) => {
     clearInterval(heartbeat);
     abortController.abort();
   };
-  req.on('close', cleanup);
+  // 客户端断开检测必须挂在 res 上：req 的 close 在请求体读完即触发，
+  // 会误伤刚发起的 LLM 流（现象：[LLM连接失败] canceled）
+  res.on('close', () => {
+    if (!res.writableEnded) cleanup();
+  });
   const safeWrite = (evt) => {
     if (closed) return false;
     try { res.write(sse(evt)); return true; } catch (_) { return false; }
