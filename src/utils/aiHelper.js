@@ -162,21 +162,24 @@ function fillMissingDates(contacts) {
   }
 }
 
-// ── SiliconFlow API 调用（对齐 ai.py _call_siliconflow）──
+// ── MiniMax M3 API 调用（原 SiliconFlow，现统一走 LLM_* 配置）──
+// M3 约束：max_completion_tokens 最低 16384；thinking 可关省 token
+const MIN_MAX_TOKENS = 16384;
 async function callSiliconflow(messages, { maxTokens = 8192, extraParams = {} } = {}) {
   const body = {
-    model: config.SILICONFLOW_MODEL,
+    model: config.LLM_MODEL,
     messages,
-    max_tokens: maxTokens,
+    max_completion_tokens: Math.max(maxTokens, MIN_MAX_TOKENS),
     temperature: 0.1,
+    thinking: { type: config.LLM_THINKING || 'disabled' },
     ...extraParams,
   };
   let resp;
   try {
-    resp = await axios.post(config.SILICONFLOW_API_URL, body, {
-      timeout: 60000,
+    resp = await axios.post(config.LLM_API_URL, body, {
+      timeout: 120000,
       headers: {
-        Authorization: `Bearer ${config.SILICONFLOW_API_KEY}`,
+        Authorization: `Bearer ${config.LLM_API_KEY}`,
         'Content-Type': 'application/json',
       },
     });
@@ -189,7 +192,7 @@ async function callSiliconflow(messages, { maxTokens = 8192, extraParams = {} } 
     throw httpError(500, 'AI 识别失败，请稍后重试');
   }
   let content = (((resp.data || {}).choices || [{}])[0].message || {}).content || '';
-  // 剥离 Qwen3 思考过程
+  // 剥离思考过程（thinking disabled 时一般不会有，兜底）
   content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   return content;
 }

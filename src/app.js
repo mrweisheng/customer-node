@@ -60,6 +60,7 @@ app.use('/customerapi/auth', require('./routers/auth'));
 app.use('/customerapi/user', require('./routers/user'));
 app.use('/customerapi/customers', require('./routers/customers'));
 app.use('/customerapi/customers', require('./routers/ai'));
+app.use('/customerapi/customers/agent', require('./routers/agent'));
 
 // ── 404 ────────────────────────────────────────────────
 app.use((req, res) => {

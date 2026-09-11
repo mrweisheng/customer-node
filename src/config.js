@@ -5,9 +5,9 @@ const REQUIRED = [
   'JWT_SECRET_KEY',
   'WX_APPID',
   'WX_SECRET',
-  'SILICONFLOW_API_KEY',
-  'SILICONFLOW_API_URL',
-  'SILICONFLOW_MODEL',
+  'LLM_API_KEY',
+  'LLM_API_URL',
+  'LLM_MODEL',
 ];
 const missing = REQUIRED.filter((k) => !process.env[k]);
 if (missing.length) {
@@ -31,14 +31,17 @@ const config = {
   WX_APPID: process.env.WX_APPID,
   WX_SECRET: process.env.WX_SECRET,
 
-  // SiliconFlow AI
-  SILICONFLOW_API_KEY: process.env.SILICONFLOW_API_KEY,
-  SILICONFLOW_API_URL: process.env.SILICONFLOW_API_URL,
-  SILICONFLOW_MODEL: process.env.SILICONFLOW_MODEL,
-
   // AI 限流
   AI_RATE_LIMIT_WINDOW: parseInt(process.env.AI_RATE_LIMIT_WINDOW, 10) || 60,
   AI_RATE_LIMIT_MAX: parseInt(process.env.AI_RATE_LIMIT_MAX, 10) || 30,
+
+  // AI（MiniMax M3，统一供 agent 对话与截图识别使用）
+  LLM_API_URL: process.env.LLM_API_URL,
+  LLM_API_KEY: process.env.LLM_API_KEY,
+  LLM_MODEL: process.env.LLM_MODEL,
+  LLM_THINKING: process.env.LLM_THINKING || 'disabled',
+  LLM_MAX_TOKENS: parseInt(process.env.LLM_MAX_TOKENS, 10) || 8192,
+  LLM_MAX_TOOL_ITER: parseInt(process.env.LLM_MAX_TOOL_ITER, 10) || 5,
 };
 
 module.exports = config;
