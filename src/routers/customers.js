@@ -41,6 +41,22 @@ function getOwnedCustomer(customerId, userId) {
   return db.prepare('SELECT * FROM customers WHERE id = ? AND user_id = ?').get(customerId, userId);
 }
 
+// 管理员可查看任意客户详情（只读）；普通用户仅本人
+function getVisibleCustomer(customerId, user) {
+  if (user.role === 'admin') {
+    return db.prepare('SELECT * FROM customers WHERE id = ?').get(customerId);
+  }
+  return getOwnedCustomer(customerId, user.id);
+}
+
+// 管理员全库只读：一切写操作（录入/编辑/删除/标记）直接 403
+function adminReadOnly(req, res, next) {
+  if (req.user.role === 'admin') {
+    return next(httpError(403, '管理员账号仅可查看，不支持录入/编辑'));
+  }
+  next();
+}
+
 // 成交时间校验：合法 YYYY-MM-DD 返回原值，否则 null
 function normalizeDealTime(v) {
   return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
@@ -515,7 +531,7 @@ router.get('/visit-list', authRequired, (req, res, next) => {
 
 // ── PUT /:customer_id/needs ────────────────────────────
 // 更新客户"当前需求"（客户级字段）；followup=true 时同步追加一条跟进留痕
-router.put('/:customer_id/needs', authRequired, (req, res, next) => {
+router.put('/:customer_id/needs', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -541,7 +557,7 @@ router.put('/:customer_id/needs', authRequired, (req, res, next) => {
 });
 
 // ── PUT /:customer_id/priority ─────────────────────────
-router.put('/:customer_id/priority', authRequired, (req, res, next) => {
+router.put('/:customer_id/priority', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -569,7 +585,7 @@ router.put('/:customer_id/priority', authRequired, (req, res, next) => {
 });
 
 // ── PUT /:customer_id/visit ────────────────────────────
-router.put('/:customer_id/visit', authRequired, (req, res, next) => {
+router.put('/:customer_id/visit', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -669,7 +685,7 @@ router.get('/:customer_id/followups', authRequired, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
-    const customer = getOwnedCustomer(customerId, req.user.id);
+    const customer = getVisibleCustomer(customerId, req.user);
     if (!customer) return next(httpError(404, '客户不存在'));
     const rows = db.prepare(
       'SELECT * FROM customer_followups WHERE customer_id = ? ORDER BY created_at DESC, id DESC'
@@ -680,7 +696,7 @@ router.get('/:customer_id/followups', authRequired, (req, res, next) => {
 
 // ── POST /:customer_id/followups ───────────────────────
 // 追加一条跟进记录（INSERT 历史 + 刷新 customers.remark/last_visit_at 缓存）
-router.post('/:customer_id/followups', authRequired, (req, res, next) => {
+router.post('/:customer_id/followups', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -707,7 +723,7 @@ router.get('/:customer_id/visits', authRequired, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
-    const customer = getOwnedCustomer(customerId, req.user.id);
+    const customer = getVisibleCustomer(customerId, req.user);
     if (!customer) return next(httpError(404, '客户不存在'));
     const rows = db.prepare(
       `SELECT * FROM customer_visits WHERE customer_id = ?
@@ -720,7 +736,7 @@ router.get('/:customer_id/visits', authRequired, (req, res, next) => {
 // ── POST /:customer_id/visits ──────────────────────────
 // 录入一条到店记录（仅「未成交」：成交到店由 POST /deals 自动生成，不在此录入）
 //   needs 必填 → 自动 is_priority=1，remark=needs（每次都刷新），追加跟进留痕
-router.post('/:customer_id/visits', authRequired, (req, res, next) => {
+router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -752,7 +768,7 @@ router.post('/:customer_id/visits', authRequired, (req, res, next) => {
 
 // ── PUT /:customer_id/visits/:visit_id ─────────────────
 // 编辑某条到店记录（仅改到店日/需求/备注；is_deal 与 deal_id 由成交联动管理，此处不变）
-router.put('/:customer_id/visits/:visit_id', authRequired, (req, res, next) => {
+router.put('/:customer_id/visits/:visit_id', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     const visitId = parseInt(req.params.visit_id, 10);
@@ -779,7 +795,7 @@ router.put('/:customer_id/visits/:visit_id', authRequired, (req, res, next) => {
 
 // ── DELETE /:customer_id/visits/:visit_id ──────────────
 // 删除某条到店记录（不连带删除关联的成交记录）
-router.delete('/:customer_id/visits/:visit_id', authRequired, (req, res, next) => {
+router.delete('/:customer_id/visits/:visit_id', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     const visitId = parseInt(req.params.visit_id, 10);
@@ -799,7 +815,7 @@ router.get('/:customer_id/deals', authRequired, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
-    const customer = getOwnedCustomer(customerId, req.user.id);
+    const customer = getVisibleCustomer(customerId, req.user);
     if (!customer) return next(httpError(404, '客户不存在'));
     const rows = db.prepare(
       `SELECT * FROM customer_deals WHERE customer_id = ?
@@ -848,7 +864,7 @@ function insertDealRow(customerId, userId, d) {
 
 // ── POST /:customer_id/deals ───────────────────────────
 // 新增一条成交（车辆或两地牌）；成交即到店：自动生成到店记录；成交即转化：自动取消重点
-router.post('/:customer_id/deals', authRequired, (req, res, next) => {
+router.post('/:customer_id/deals', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -880,7 +896,7 @@ router.post('/:customer_id/deals', authRequired, (req, res, next) => {
 
 // ── PUT /:customer_id/deals/:deal_id ───────────────────
 // 编辑某条成交
-router.put('/:customer_id/deals/:deal_id', authRequired, (req, res, next) => {
+router.put('/:customer_id/deals/:deal_id', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     const dealId = parseInt(req.params.deal_id, 10);
@@ -900,7 +916,7 @@ router.put('/:customer_id/deals/:deal_id', authRequired, (req, res, next) => {
 
 // ── DELETE /:customer_id/deals/:deal_id ────────────────
 // 删除某条成交（不自动恢复重点，如需恢复请在面板手动标注）
-router.delete('/:customer_id/deals/:deal_id', authRequired, (req, res, next) => {
+router.delete('/:customer_id/deals/:deal_id', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     const dealId = parseInt(req.params.deal_id, 10);

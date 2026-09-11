@@ -135,6 +135,10 @@ function validateContactDate(v) {
 }
 
 router.post('/batch-import', authRequired, (req, res, next) => {
+  // 管理员全库只读：不允许录入客户
+  if (req.user.role === 'admin') {
+    return next(httpError(403, '管理员账号仅可查看，不支持录入'));
+  }
   const contacts = (req.body || {}).contacts;
   if (!Array.isArray(contacts) || contacts.length > 200) {
     return next(httpError(422, 'contacts 必须是数组且不超过 200 条'));
