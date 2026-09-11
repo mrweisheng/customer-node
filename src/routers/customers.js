@@ -612,7 +612,7 @@ router.get('/priority-analysis', authRequired, async (req, res, next) => {
     ).get(...uf.params, ymd(startDate), ymd(endDate)).c;
 
     const priorityRows = db.prepare(
-      `SELECT id, customer_name, current_needs, remark FROM customers
+      `SELECT id, customer_name, lead_date, current_needs, remark FROM customers
        WHERE ${uf.clause} AND lead_date >= ? AND lead_date <= ? AND is_priority = 1
        ORDER BY lead_date DESC`
     ).all(...uf.params, ymd(startDate), ymd(endDate));
@@ -635,17 +635,19 @@ router.get('/priority-analysis', authRequired, async (req, res, next) => {
 
     const modules = MODULES.map((m) => ({ key: m.key, name: m.name, count: 0, customers: [] }));
     const others = { count: 0, customers: [] };
+    // 名单元素带 lead_date，前端展示为「日期短码/姓名」（如 60908/郑泽坚）
+    const brief = (c) => ({ name: c.customer_name, lead_date: c.lead_date });
     for (const c of priorityRows) {
       const labels = (labelsById[c.id] || []).filter((l) => modules.some((m) => m.key === l));
       if (labels.length === 0) {
-        others.count++;
-        others.customers.push(c.customer_name);
+        others.count += 1;
+        others.customers.push(brief(c));
         continue;
       }
       for (const l of labels) {
         const m = modules.find((x) => x.key === l);
         m.count += 1;
-        m.customers.push(c.customer_name);
+        m.customers.push(brief(c));
       }
     }
 
