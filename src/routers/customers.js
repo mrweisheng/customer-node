@@ -6,6 +6,7 @@ const db = require('../db');
 const authRequired = require('../middleware/auth');
 const { httpError } = require('../middleware/errorHandler');
 const { serializeCustomer, serializeDeal, serializeFollowup, serializeVisit } = require('../utils/serialize');
+const { MODULES, classifyCustomers } = require('../utils/needClassifier');
 
 const pad = (n) => String(n).padStart(2, '0');
 const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -588,6 +589,75 @@ router.put('/:customer_id/visit', authRequired, (req, res, next) => {
     });
     tx();
     res.json({ code: 0, msg: '回访记录已保存' });
+  } catch (e) { next(e); }
+});
+
+// ── GET /priority-analysis ─────────────────────────────
+// 最近 N 天（截止昨天，与 /trend 口径一致）出的线索中有多少被标为重点，
+// 并按业务板块（香港移民/卖车/办两地牌，可多选）用 AI 对重点客户的需求归类
+router.get('/priority-analysis', authRequired, async (req, res, next) => {
+  try {
+    let days = parseInt(req.query.days, 10);
+    if (Number.isNaN(days)) days = 7;
+    days = Math.min(90, Math.max(1, days));
+    const targetUserId = optInt(req.query.target_user_id);
+    const uf = buildUserFilter(req.user, targetUserId);
+
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const endDate = addDays(today, -1);
+    const startDate = addDays(endDate, -(days - 1));
+
+    const leads = db.prepare(
+      `SELECT COUNT(*) AS c FROM customers WHERE ${uf.clause} AND lead_date >= ? AND lead_date <= ?`
+    ).get(...uf.params, ymd(startDate), ymd(endDate)).c;
+
+    const priorityRows = db.prepare(
+      `SELECT id, customer_name, current_needs, remark FROM customers
+       WHERE ${uf.clause} AND lead_date >= ? AND lead_date <= ? AND is_priority = 1
+       ORDER BY lead_date DESC`
+    ).all(...uf.params, ymd(startDate), ymd(endDate));
+
+    // 合并 当前需求 + 备注 + 最新一条跟进，供 AI 理解最新需求状态
+    const fuStmt = db.prepare(
+      'SELECT content FROM customer_followups WHERE customer_id = ? ORDER BY created_at DESC, id DESC LIMIT 1'
+    );
+    const items = priorityRows.map((c) => {
+      let fu = null;
+      try { fu = fuStmt.get(c.id); } catch { /* 跟进缺失不阻塞 */ }
+      const text = [c.current_needs, c.remark, fu ? fu.content : ''].filter(Boolean).join('；') || '（无需求文本）';
+      return { id: c.id, text };
+    });
+
+    let labelsById = {};
+    if (items.length > 0) {
+      try { labelsById = await classifyCustomers(items); } catch { /* 已有兜底 */ }
+    }
+
+    const modules = MODULES.map((m) => ({ key: m.key, name: m.name, count: 0, customers: [] }));
+    const others = { count: 0, customers: [] };
+    for (const c of priorityRows) {
+      const labels = (labelsById[c.id] || []).filter((l) => modules.some((m) => m.key === l));
+      if (labels.length === 0) {
+        others.count++;
+        others.customers.push(c.customer_name);
+        continue;
+      }
+      for (const l of labels) {
+        const m = modules.find((x) => x.key === l);
+        m.count += 1;
+        m.customers.push(c.customer_name);
+      }
+    }
+
+    res.json({
+      days,
+      start: ymd(startDate),
+      end: ymd(endDate),
+      leads,
+      priority: priorityRows.length,
+      modules,
+      others,
+    });
   } catch (e) { next(e); }
 });
 

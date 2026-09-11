@@ -80,6 +80,14 @@ CREATE TABLE IF NOT EXISTS customer_followups (
 CREATE INDEX IF NOT EXISTS idx_followups_customer ON customer_followups(customer_id);
 CREATE INDEX IF NOT EXISTS idx_followups_user ON customer_followups(user_id);
 
+-- AI 板块需求分类缓存：customer_id + 需求文本指纹 → 板块标签 JSON（文本未变不重复调用 LLM）
+CREATE TABLE IF NOT EXISTS ai_need_classifications (
+  customer_id INTEGER PRIMARY KEY REFERENCES customers(id),
+  text_hash TEXT NOT NULL,
+  labels_json TEXT NOT NULL,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 到店记录（客户到店事件，与跟进/回访分开）
 -- 未成交：写清需求，自动标重点；已成交：可同时生成成交记录并通过 deal_id 关联
 CREATE TABLE IF NOT EXISTS customer_visits (
