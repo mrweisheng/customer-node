@@ -140,14 +140,16 @@ router.get('/trend', authRequired, (req, res, next) => {
     days = Math.min(90, Math.max(1, days));
     const previous = req.query.previous === undefined ? true : req.query.previous !== 'false';
 
+    // 统计口径：区间最后一天为昨天——当天数据可能尚未统计完整（一般在晚间/次日统计）
     const today = new Date(); today.setHours(0, 0, 0, 0);
-    const startDate = addDays(today, -(days - 1));
+    const endDate = addDays(today, -1);
+    const startDate = addDays(endDate, -(days - 1));
 
     const rows = db.prepare(
       `SELECT lead_date, COUNT(*) AS c FROM customers
        WHERE ${uf.clause} AND lead_date >= ? AND lead_date <= ?
        GROUP BY lead_date`
-    ).all(...uf.params, ymd(startDate), ymd(today));
+    ).all(...uf.params, ymd(startDate), ymd(endDate));
     const countMap = {};
     for (const r of rows) countMap[r.lead_date] = r.c;
 
