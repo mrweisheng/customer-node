@@ -696,10 +696,10 @@ router.get('/:customer_id/followups', authRequired, (req, res, next) => {
 });
 
 // ── POST /:customer_id/followups ───────────────────────
-// 追加一条跟进记录（INSERT 历史 + 刷新 customers.remark/last_visit_at 缓存）
-// 保存成功后调 AI 分析：跟进是否推翻「当前需求」——有冲突则自动更新需求并留痕；
-// AI 超时/解析失败一律静默跳过（红线：绝不阻塞、绝不影响跟进保存结果）
-router.post('/:customer_id/followups', authRequired, adminReadOnly, async (req, res, next) => {
+// 追加一条跟进记录：写库后立即返回；AI 需求冲突分析在后台静默执行
+// （检测到需求变化 → 自动更新当前需求 + 留痕；AI 超时/失败/结论无效 = 无操作，
+//   绝不影响已保存的跟进，前端通过轮询客户数据获取最新需求）
+router.post('/:customer_id/followups', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -720,27 +720,23 @@ router.post('/:customer_id/followups', authRequired, adminReadOnly, async (req, 
         .run(content, customerId);
     });
     tx();
-    // ── AI 需求冲突分析（可失败，失败=无操作）──────────────
-    let needsUpdated = null;
-    try {
-      const analysis = await analyzeNeedsConflict({
-        currentNeeds: customer.current_needs || '',
-        followupContent: content,
-        recentFollowups: prevFollowups,
-      });
-      if (analysis && analysis.conflict) {
-        db.prepare('UPDATE customers SET current_needs = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-          .run(analysis.newNeeds, customerId);
-        db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
-          .run(customerId, req.user.id, `需求已随跟进自动更新：${analysis.newNeeds}`);
-        needsUpdated = { current_needs: analysis.newNeeds, reason: analysis.reason };
-      }
-    } catch (_) { /* AI 环节任何异常都不影响已保存的跟进 */ }
-    res.json({
-      code: 0,
-      msg: needsUpdated ? '跟进已保存，需求已自动更新' : '跟进记录已保存',
-      ...(needsUpdated ? { needs_updated: needsUpdated } : {}),
-    });
+    // ── AI 需求冲突分析：后台静默执行，不阻塞保存响应 ──
+    void (async () => {
+      try {
+        const analysis = await analyzeNeedsConflict({
+          currentNeeds: customer.current_needs || '',
+          followupContent: content,
+          recentFollowups: prevFollowups,
+        });
+        if (analysis && analysis.conflict) {
+          db.prepare('UPDATE customers SET current_needs = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+            .run(analysis.newNeeds, customerId);
+          db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+            .run(customerId, req.user.id, `需求已随跟进自动更新：${analysis.newNeeds}`);
+        }
+      } catch (_) { /* 静默：分析失败不影响任何已保存数据 */ }
+    })();
+    res.json({ code: 0, msg: '跟进记录已保存' });
   } catch (e) { next(e); }
 });
 
@@ -956,6 +952,18 @@ router.delete('/:customer_id/deals/:deal_id', authRequired, adminReadOnly, (req,
       .run(dealId, customerId, req.user.id);
     if (info.changes === 0) return next(httpError(404, '成交记录不存在'));
     res.json({ code: 0, msg: '成交已删除' });
+  } catch (e) { next(e); }
+});
+
+// ── GET /:customer_id ──────────────────────────────────
+// 单客户详情（编辑面板复查当前需求/重点状态）；放在最后，避免遮蔽上方字面量路由
+router.get('/:customer_id', authRequired, (req, res, next) => {
+  try {
+    const customerId = parseInt(req.params.customer_id, 10);
+    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    const customer = getVisibleCustomer(customerId, req.user);
+    if (!customer) return next(httpError(404, '客户不存在'));
+    res.json(serializeCustomer(customer));
   } catch (e) { next(e); }
 });
 
