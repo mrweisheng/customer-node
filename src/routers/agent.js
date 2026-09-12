@@ -59,7 +59,8 @@ router.post('/chat', authRequired, async (req, res, next) => {
   }
   if (pendingImage) {
     const last = messages[messages.length - 1];
-    const text = (last && last.role === 'user' && typeof last.content === 'string')
+    // 前端支持只发图不打字（拖拽/回车直发），空文本时兜底默认识别指令
+    const text = (last && last.role === 'user' && typeof last.content === 'string' && last.content.trim())
       ? last.content
       : '请识别这张截图中的联系人';
     const userMsg = {
