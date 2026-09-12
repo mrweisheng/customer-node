@@ -225,11 +225,30 @@ router.get('/priority', authRequired, (req, res, next) => {
   try {
     const targetUserId = optInt(req.query.target_user_id);
     const uf = buildUserFilter(req.user, targetUserId);
+    // 附加每位客户最新一条有效动态（到店/跟进取较新者；排除需求变更留痕，
+    // 留痕内容与需求快照重复，不适合作为卡片动态展示）
     const rows = db.prepare(
-      `SELECT * FROM customers WHERE ${uf.clause} AND is_priority IS TRUE
-       ORDER BY (last_visit_at IS NULL) DESC, last_visit_at ASC, lead_date DESC`
+      `SELECT c.*,
+         (SELECT v.needs FROM customer_visits v WHERE v.customer_id = c.id ORDER BY v.created_at DESC, v.id DESC LIMIT 1) AS last_visit_needs,
+         (SELECT v.created_at FROM customer_visits v WHERE v.customer_id = c.id ORDER BY v.created_at DESC, v.id DESC LIMIT 1) AS last_visit_created_at,
+         (SELECT f.content FROM customer_followups f WHERE f.customer_id = c.id AND f.content NOT LIKE '更新需求：%' AND f.content NOT LIKE '需求已自动更新：%' AND f.content NOT LIKE '需求已随跟进自动更新：%' ORDER BY f.created_at DESC, f.id DESC LIMIT 1) AS last_followup_content,
+         (SELECT f.created_at FROM customer_followups f WHERE f.customer_id = c.id AND f.content NOT LIKE '更新需求：%' AND f.content NOT LIKE '需求已自动更新：%' AND f.content NOT LIKE '需求已随跟进自动更新：%' ORDER BY f.created_at DESC, f.id DESC LIMIT 1) AS last_followup_at
+       FROM customers c WHERE ${uf.clause} AND c.is_priority IS TRUE
+       ORDER BY (c.last_visit_at IS NULL) DESC, c.last_visit_at ASC, c.lead_date DESC`
     ).all(...uf.params);
-    res.json(rows.map(serializeCustomer));
+    res.json(rows.map((r) => {
+      const s = serializeCustomer(r);
+      const visitAt = String(r.last_visit_created_at || '');
+      const followupAt = String(r.last_followup_at || '');
+      let lastActivity = null;
+      if (visitAt && visitAt >= followupAt) {
+        lastActivity = { type: 'visit', content: String(r.last_visit_needs || '').trim(), at: visitAt };
+      } else if (followupAt) {
+        lastActivity = { type: 'followup', content: String(r.last_followup_content || '').trim(), at: followupAt };
+      }
+      if (!lastActivity || !lastActivity.content) lastActivity = null;
+      return { ...s, last_activity: lastActivity };
+    }));
   } catch (e) { next(e); }
 });
 
@@ -566,18 +585,25 @@ router.put('/:customer_id/priority', authRequired, adminReadOnly, (req, res, nex
     const customer = db.prepare('SELECT * FROM customers WHERE id = ? AND user_id = ?').get(customerId, req.user.id);
     if (!customer) return next(httpError(404, '客户不存在'));
 
-    // 标注/取消重点：更新标记，备注非空时同时追加一条跟进历史（保证历史完整）
+    // 标注/取消重点：更新标记；显式传了 remark 才更新备注并追加跟进历史
+    // （未传 remark 时不动备注字段——历史实现会把 remark 清成 NULL，属于数据破坏）
     // 标注重点时把 last_visit_at 重置为当前时间，作为"最近接触时间"起点，
     // 让"待回访"状态从标重点那一刻开始算 7 天绿、30 天黄、超期红（与到店路径对齐）
-    const remarkText = remark === undefined ? null : remark;
+    const remarkText = remark === undefined ? null : String(remark).trim() || null;
     const setLastVisit = is_priority ? ', last_visit_at = CURRENT_TIMESTAMP' : '';
     const tx = db.transaction(() => {
-      db.prepare(
-        `UPDATE customers SET is_priority = ?, remark = ?${setLastVisit}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-      ).run(is_priority ? 1 : 0, remarkText, customerId);
-      if (remarkText && String(remarkText).trim()) {
-        db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
-          .run(customerId, req.user.id, `${is_priority ? '标注重点' : '取消重点'}：${String(remarkText).trim()}`);
+      if (remark === undefined) {
+        db.prepare(
+          `UPDATE customers SET is_priority = ?${setLastVisit}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+        ).run(is_priority ? 1 : 0, customerId);
+      } else {
+        db.prepare(
+          `UPDATE customers SET is_priority = ?, remark = ?${setLastVisit}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+        ).run(is_priority ? 1 : 0, remarkText, customerId);
+        if (remarkText) {
+          db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+            .run(customerId, req.user.id, `${is_priority ? '标注重点' : '取消重点'}：${remarkText}`);
+        }
       }
     });
     tx();
@@ -716,8 +742,9 @@ router.post('/:customer_id/followups', authRequired, adminReadOnly, (req, res, n
     const tx = db.transaction(() => {
       db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
         .run(customerId, req.user.id, content);
-      db.prepare('UPDATE customers SET remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(content, customerId);
+      // 刷新最近接触时间；客户备注不再被跟进内容覆写（remark 镜像已废弃）
+      db.prepare('UPDATE customers SET last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(customerId);
     });
     tx();
     // ── AI 需求冲突分析：后台静默执行，不阻塞保存响应 ──
@@ -775,7 +802,7 @@ router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next
     const visitTime = normalizeDealTime(b.visit_time) || ymd(new Date()); // 空或不合法→今天
     const needs = b.needs != null ? String(b.needs).trim() : '';
     const remark = b.remark != null ? String(b.remark).trim() || null : null;
-    if (!needs) return next(httpError(422, '请填写需求'));
+    if (!needs) return next(httpError(422, '请填写本次到店情况'));
 
     // 插入前的最近几条跟进，作为 AI 判断的上下文
     const prevFollowups = db.prepare(
@@ -787,10 +814,11 @@ router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next
         `INSERT INTO customer_visits (customer_id, user_id, visit_time, needs, is_deal, deal_id, remark)
          VALUES (?, ?, ?, ?, 0, NULL, ?)`
       ).run(customerId, req.user.id, visitTime, needs, remark);
-      // 未成交：自动标重点 + 刷新备注为本次内容；到店视作一次接触，刷新 last_visit_at
-      // 当前需求不由到店内容直接覆盖，交由下方 AI 后台分析决定是否变更
-      db.prepare('UPDATE customers SET is_priority = 1, remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(needs, customerId);
+      // 未成交：自动标重点 + 刷新 last_visit_at（到店视作一次接触）
+      // 当前需求不由到店内容直接覆盖，交由下方 AI 后台分析决定是否变更；
+      // 客户备注不再被到店内容覆写（remark 镜像已废弃，避免污染导入/手动备注）
+      db.prepare('UPDATE customers SET is_priority = 1, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(customerId);
       // 到店即第一次跟进：需求默认为跟进内容
       db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
         .run(customerId, req.user.id, `到店：${needs}`);
