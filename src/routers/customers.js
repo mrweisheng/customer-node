@@ -960,7 +960,8 @@ router.delete('/:customer_id/deals/:deal_id', authRequired, adminReadOnly, (req,
 router.get('/:customer_id', authRequired, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
-    if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
+    // 非数字路径（如 ai.js 的 /daily-quote）放行给后续挂载的路由处理
+    if (Number.isNaN(customerId)) return next();
     const customer = getVisibleCustomer(customerId, req.user);
     if (!customer) return next(httpError(404, '客户不存在'));
     res.json(serializeCustomer(customer));
