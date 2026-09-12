@@ -773,20 +773,43 @@ router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next
     const remark = b.remark != null ? String(b.remark).trim() || null : null;
     if (!needs) return next(httpError(422, '请填写需求'));
 
+    // 插入前的最近几条跟进，作为 AI 判断的上下文
+    const prevFollowups = db.prepare(
+      'SELECT content FROM customer_followups WHERE customer_id = ? ORDER BY created_at DESC, id DESC LIMIT 3'
+    ).all(customerId).map((r) => r.content);
+
     const tx = db.transaction(() => {
       const info = db.prepare(
         `INSERT INTO customer_visits (customer_id, user_id, visit_time, needs, is_deal, deal_id, remark)
          VALUES (?, ?, ?, ?, 0, NULL, ?)`
       ).run(customerId, req.user.id, visitTime, needs, remark);
-      // 未成交：自动标重点 + 刷新备注/当前需求为本次需求；到店视作一次接触，刷新 last_visit_at
-      db.prepare('UPDATE customers SET is_priority = 1, remark = ?, current_needs = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(needs, needs, customerId);
-      // 到店即第一次跟进：需求默认为跟进内容（动态时间线里由到店记录代表，不重复展示）
+      // 未成交：自动标重点 + 刷新备注为本次内容；到店视作一次接触，刷新 last_visit_at
+      // 当前需求不由到店内容直接覆盖，交由下方 AI 后台分析决定是否变更
+      db.prepare('UPDATE customers SET is_priority = 1, remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(needs, customerId);
+      // 到店即第一次跟进：需求默认为跟进内容
       db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
         .run(customerId, req.user.id, `到店：${needs}`);
       return info.lastInsertRowid;
     });
     const visitId = tx();
+    // ── AI 需求冲突分析：后台静默执行（与跟进同款）──
+    // 到店内容不一定构成需求变更（如"过来看一看"），AI 判定有明确变化才更新当前需求并留痕
+    void (async () => {
+      try {
+        const analysis = await analyzeNeedsConflict({
+          currentNeeds: customer.current_needs || '',
+          followupContent: needs,
+          recentFollowups: prevFollowups,
+        });
+        if (analysis && analysis.conflict) {
+          db.prepare('UPDATE customers SET current_needs = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+            .run(analysis.newNeeds, customerId);
+          db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+            .run(customerId, req.user.id, `需求已自动更新：${analysis.newNeeds}`);
+        }
+      } catch (_) { /* 静默：分析失败不影响任何已保存数据 */ }
+    })();
     res.json({ code: 0, msg: '到店已记录，已自动标为重点客户', visit_id: visitId });
   } catch (e) { next(e); }
 });
