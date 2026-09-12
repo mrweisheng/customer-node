@@ -783,9 +783,11 @@ router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next
          VALUES (?, ?, ?, ?, 0, NULL, ?)`
       ).run(customerId, req.user.id, visitTime, needs, remark);
       // 未成交：自动标重点 + 刷新备注/当前需求为本次需求；到店视作一次接触，刷新 last_visit_at
-      // （到店记录本身会出现在动态时间线里，不再重复写一条"到店未成交"跟进留痕）
       db.prepare('UPDATE customers SET is_priority = 1, remark = ?, current_needs = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(needs, needs, customerId);
+      // 到店即第一次跟进：需求默认为跟进内容（动态时间线里由到店记录代表，不重复展示）
+      db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+        .run(customerId, req.user.id, `到店：${needs}`);
       return info.lastInsertRowid;
     });
     const visitId = tx();
