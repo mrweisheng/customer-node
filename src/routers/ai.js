@@ -11,6 +11,7 @@ const {
   VL_SYSTEM_PROMPT, callSiliconflow, extractJson, parseSections,
   splitNameRemark, cleanContacts, hasMissingDates, fillMissingDates,
 } = require('../utils/aiHelper');
+const { validateContactDate, parseLeadDate } = require('../utils/dateRules');
 
 // 内存限流：user_id → 时间戳数组（对齐 ai.py _check_rate_limit）
 const rateLimitStore = new Map();
@@ -119,20 +120,7 @@ router.post('/analyze-image', authRequired, (req, res, next) => {
 });
 
 // ── POST /batch-import ─────────────────────────────────
-const MAX_DAYS = { 1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31 };
-
-// schema 校验（对齐 Python schemas.ImportContact.validate_date_format）
-// 注意：Python 在请求进路由前由 Pydantic 校验，任何一条 date 非法 → 整个请求 422
-function validateContactDate(v) {
-  let d = String(v || '');
-  if (/^\d{5}$/.test(d)) d = d.slice(1); // YMMDD → MMDD
-  if (!/^\d{4}$/.test(d)) throw new Error('日期格式必须为 MMDD 四位数字或 YMMDD 五位数字');
-  const month = parseInt(d.slice(0, 2), 10);
-  const day = parseInt(d.slice(2), 10);
-  if (month < 1 || month > 12) throw new Error('月份必须在 01-12 之间');
-  if (day < 1 || day > MAX_DAYS[month]) throw new Error(`${month}月的日期必须在 01-${MAX_DAYS[month]} 之间`);
-  return d; // 返回规整后的 4 位 MMDD
-}
+// 日期校验/lead_date 解析复用 utils/dateRules（与 agentTools、check-duplicates 共享）
 
 router.post('/batch-import', authRequired, (req, res, next) => {
   // 管理员全库只读：不允许录入客户
@@ -157,18 +145,13 @@ router.post('/batch-import', authRequired, (req, res, next) => {
 
   let added = 0, updated = 0, skipped = 0;
   const skippedNames = [];
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const currentYear = today.getFullYear();
 
   // 解析为 leadDate（格式已校验合法，这里不会抛）
   const parsed = [];
   for (const c of normalized) {
-    const month = parseInt(c.date.slice(0, 2), 10);
-    const day = parseInt(c.date.slice(2), 10);
-    let leadDate = new Date(currentYear, month - 1, day);
-    if (leadDate > today) leadDate = new Date(currentYear - 1, month - 1, day);
+    const { leadDate } = parseLeadDate(c.date);
     parsed.push({
-      leadDate: `${leadDate.getFullYear()}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+      leadDate,
       name: c.name,
       remark: c.remark,
     });
@@ -231,20 +214,15 @@ router.post('/check-duplicates', authRequired, (req, res, next) => {
     return next(httpError(422, 'contacts 必须是数组且不超过 200 条'));
   }
 
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const currentYear = today.getFullYear();
   const parsed = [];
   for (const c of contacts) {
     let d;
     try { d = validateContactDate(c.date); } catch (e) { return next(httpError(422, e.message)); }
-    const month = parseInt(d.slice(0, 2), 10);
-    const day = parseInt(d.slice(2), 10);
-    let leadDate = new Date(currentYear, month - 1, day);
-    if (leadDate > today) leadDate = new Date(currentYear - 1, month - 1, day);
+    const { leadDate } = parseLeadDate(d);
     parsed.push({
       date: d,
       name: String(c.name || ''),
-      lead: `${leadDate.getFullYear()}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+      lead: leadDate,
     });
   }
 

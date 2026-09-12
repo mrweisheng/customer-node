@@ -199,7 +199,6 @@ async function callSiliconflow(messages, { maxTokens = 8192, extraParams = {} } 
 
 module.exports = {
   VL_SYSTEM_PROMPT,
-  tryFixTruncatedJson,
   extractJson,
   parseSections,
   splitNameRemark,

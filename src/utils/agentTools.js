@@ -3,8 +3,9 @@
 //   - LLM 只读不写：写入数据库必须由前端用户点击确认后调 /batch-import
 //   - 单工具原则：识别 + 查重合并为 submit_recognition_result
 //     （M3 直接看图识别，后端只负责格式校验 + 查重）
-//   - 校验逻辑严格复用 ai.js 的 validateContactDate / 数据库查重，保持一致性
+//   - 日期校验/查重复用 utils/dateRules + 数据库查重，与 ai.js 的 batch-import 一致
 const db = require('../db');
+const { validateContactDate, parseLeadDate } = require('./dateRules');
 // ── 工具 schema（OpenAI 兼容格式）───────────────────────────
 const TOOLS = [
   {
@@ -44,35 +45,7 @@ const TOOLS = [
     },
   },
 ];
-// ── 日期校验（对齐 ai.js 的 validateContactDate）───────────────
-const MAX_DAYS = {
-  1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
-  7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31,
-};
-function validateContactDate(v) {
-  let d = String(v || '');
-  if (/^\d{5}$/.test(d)) d = d.slice(1); // YMMDD → MMDD
-  if (!/^\d{4}$/.test(d)) throw new Error(`日期格式必须为 MMDD 四位数字或 YMMDD 五位数字（收到：${v}）`);
-  const month = parseInt(d.slice(0, 2), 10);
-  const day = parseInt(d.slice(2), 10);
-  if (month < 1 || month > 12) throw new Error('月份必须在 01-12 之间');
-  if (day < 1 || day > MAX_DAYS[month]) throw new Error(`${month}月的日期必须在 01-${MAX_DAYS[month]} 之间`);
-  return d;
-}
-// ── 解析为 lead_date（YYYY-MM-DD），跨年处理对齐 ai.js ───────────
-function parseLeadDate(mmd) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const currentYear = today.getFullYear();
-  const month = parseInt(mmd.slice(0, 2), 10);
-  const day = parseInt(mmd.slice(2), 10);
-  let d = new Date(currentYear, month - 1, day);
-  if (d > today) d = new Date(currentYear - 1, month - 1, day);
-  return {
-    mmdd: mmd,
- leadDate: `${d.getFullYear()}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
-  };
-}
+// ── 日期校验/解析：统一复用 utils/dateRules（与 ai.js 的 batch-import 完全一致）──
 // ── 工具执行器：submit_recognition_result ──────────────────────
 // 返回值会作为 tool 消息回填到 LLM，同时通过 SSE pending_import 事件
 // 把规整后的 contacts 推给前端，用于「确认导入」按钮的回填。
@@ -160,4 +133,4 @@ function executeToolCall({ userId, name, args, emit }) {
       throw new Error(`未知工具：${name}`);
   }
 }
-module.exports = { TOOLS, executeToolCall, parseLeadDate, validateContactDate };
+module.exports = { TOOLS, executeToolCall };

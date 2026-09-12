@@ -86,4 +86,4 @@ function serializeVisit(v) {
   };
 }
 
-module.exports = { formatDate, formatDateTime, serializeCustomer, serializeDeal, serializeFollowup, serializeVisit };
+module.exports = { serializeCustomer, serializeDeal, serializeFollowup, serializeVisit };
