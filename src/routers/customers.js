@@ -7,6 +7,7 @@ const authRequired = require('../middleware/auth');
 const { httpError } = require('../middleware/errorHandler');
 const { serializeCustomer, serializeDeal, serializeFollowup, serializeVisit } = require('../utils/serialize');
 const { MODULES, classifyCustomers } = require('../utils/needClassifier');
+const { analyzeNeedsConflict } = require('../utils/needsSync');
 
 const pad = (n) => String(n).padStart(2, '0');
 const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -696,7 +697,9 @@ router.get('/:customer_id/followups', authRequired, (req, res, next) => {
 
 // ── POST /:customer_id/followups ───────────────────────
 // 追加一条跟进记录（INSERT 历史 + 刷新 customers.remark/last_visit_at 缓存）
-router.post('/:customer_id/followups', authRequired, adminReadOnly, (req, res, next) => {
+// 保存成功后调 AI 分析：跟进是否推翻「当前需求」——有冲突则自动更新需求并留痕；
+// AI 超时/解析失败一律静默跳过（红线：绝不阻塞、绝不影响跟进保存结果）
+router.post('/:customer_id/followups', authRequired, adminReadOnly, async (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
     if (Number.isNaN(customerId)) return next(httpError(422, 'customer_id 必须是整数'));
@@ -706,6 +709,10 @@ router.post('/:customer_id/followups', authRequired, adminReadOnly, (req, res, n
     }
     const customer = getOwnedCustomer(customerId, req.user.id);
     if (!customer) return next(httpError(404, '客户不存在'));
+    // 插入前的最近几条跟进，作为 AI 判断的上下文
+    const prevFollowups = db.prepare(
+      'SELECT content FROM customer_followups WHERE customer_id = ? ORDER BY created_at DESC, id DESC LIMIT 3'
+    ).all(customerId).map((r) => r.content);
     const tx = db.transaction(() => {
       db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
         .run(customerId, req.user.id, content);
@@ -713,7 +720,27 @@ router.post('/:customer_id/followups', authRequired, adminReadOnly, (req, res, n
         .run(content, customerId);
     });
     tx();
-    res.json({ code: 0, msg: '跟进记录已保存' });
+    // ── AI 需求冲突分析（可失败，失败=无操作）──────────────
+    let needsUpdated = null;
+    try {
+      const analysis = await analyzeNeedsConflict({
+        currentNeeds: customer.current_needs || '',
+        followupContent: content,
+        recentFollowups: prevFollowups,
+      });
+      if (analysis && analysis.conflict) {
+        db.prepare('UPDATE customers SET current_needs = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .run(analysis.newNeeds, customerId);
+        db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
+          .run(customerId, req.user.id, `需求已随跟进自动更新：${analysis.newNeeds}`);
+        needsUpdated = { current_needs: analysis.newNeeds, reason: analysis.reason };
+      }
+    } catch (_) { /* AI 环节任何异常都不影响已保存的跟进 */ }
+    res.json({
+      code: 0,
+      msg: needsUpdated ? '跟进已保存，需求已自动更新' : '跟进记录已保存',
+      ...(needsUpdated ? { needs_updated: needsUpdated } : {}),
+    });
   } catch (e) { next(e); }
 });
 
@@ -735,7 +762,8 @@ router.get('/:customer_id/visits', authRequired, (req, res, next) => {
 
 // ── POST /:customer_id/visits ──────────────────────────
 // 录入一条到店记录（仅「未成交」：成交到店由 POST /deals 自动生成，不在此录入）
-//   needs 必填 → 自动 is_priority=1，remark=needs（每次都刷新），追加跟进留痕
+//   needs 必填 → 自动 is_priority=1，remark=needs（每次都刷新），
+//   当前需求快照同步刷新（到店是最新的客户信号，需求快照必须跟随）
 router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next) => {
   try {
     const customerId = parseInt(req.params.customer_id, 10);
@@ -754,11 +782,10 @@ router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next
         `INSERT INTO customer_visits (customer_id, user_id, visit_time, needs, is_deal, deal_id, remark)
          VALUES (?, ?, ?, ?, 0, NULL, ?)`
       ).run(customerId, req.user.id, visitTime, needs, remark);
-      // 未成交：自动标重点 + 刷新备注为需求；到店视作一次接触，刷新 last_visit_at
-      db.prepare('UPDATE customers SET is_priority = 1, remark = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(needs, customerId);
-      db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
-        .run(customerId, req.user.id, `到店未成交：${needs}`);
+      // 未成交：自动标重点 + 刷新备注/当前需求为本次需求；到店视作一次接触，刷新 last_visit_at
+      // （到店记录本身会出现在动态时间线里，不再重复写一条"到店未成交"跟进留痕）
+      db.prepare('UPDATE customers SET is_priority = 1, remark = ?, current_needs = ?, last_visit_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(needs, needs, customerId);
       return info.lastInsertRowid;
     });
     const visitId = tx();
