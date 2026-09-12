@@ -165,7 +165,7 @@ function fillMissingDates(contacts) {
 // ── MiniMax M3 API 调用（原 SiliconFlow，现统一走 LLM_* 配置）──
 // M3 约束：max_completion_tokens 最低 16384；thinking 可关省 token
 const MIN_MAX_TOKENS = 16384;
-async function callSiliconflow(messages, { maxTokens = 8192, extraParams = {} } = {}) {
+async function callSiliconflow(messages, { maxTokens = 8192, extraParams = {}, timeoutMs = 120000 } = {}) {
   const body = {
     model: config.LLM_MODEL,
     messages,
@@ -177,7 +177,7 @@ async function callSiliconflow(messages, { maxTokens = 8192, extraParams = {} } 
   let resp;
   try {
     resp = await axios.post(config.LLM_API_URL, body, {
-      timeout: 120000,
+      timeout: timeoutMs,
       headers: {
         Authorization: `Bearer ${config.LLM_API_KEY}`,
         'Content-Type': 'application/json',
