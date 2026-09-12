@@ -74,6 +74,9 @@ app.use(errorHandler);
 if (require.main === module) {
   app.listen(config.PORT, config.HOST, () => {
     console.log(`客户管理系统 API 运行中 → http://${config.HOST}:${config.PORT}`);
+    // 启动后后台全量扫描重点客户需求（不阻塞监听；分析失败不影响任何已存数据）
+    const { runStartupNeedsScan } = require('./utils/needsFullScan');
+    void runStartupNeedsScan();
   });
 }
 

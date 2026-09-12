@@ -13,11 +13,14 @@ const SYSTEM_PROMPT = `你是汽车销售团队的助理。一位客户有一份
 未变更时：{"conflict": false, "new_needs": "", "reason": "一句话理由"}`;
 
 /**
+ * @param {string} [logCtx] 日志上下文（如 "客户6271(张三)"），仅用于日志定位
  * @returns {Promise<{conflict: boolean, newNeeds: string, reason: string}|null>}
  *          null 表示分析失败/结论无效（调用方按无冲突处理）
  */
-async function analyzeNeedsConflict({ currentNeeds, followupContent, recentFollowups = [] }) {
+async function analyzeNeedsConflict({ currentNeeds, followupContent, recentFollowups = [], logCtx = '' } = {}) {
+  const tag = `[需求分析]${logCtx ? ' ' + logCtx : ''}`;
   try {
+    console.log(`${tag} 开始分析：当前需求=${currentNeeds ? JSON.stringify(String(currentNeeds).slice(0, 100)) : '（空）'}；新内容=${JSON.stringify(String(followupContent).slice(0, 100))}`);
     const recentText = recentFollowups.length
       ? `\n此前几条跟进（旧→新）：\n${recentFollowups.map((s) => `- ${String(s).slice(0, 200)}`).join('\n')}`
       : '';
@@ -31,14 +34,17 @@ async function analyzeNeedsConflict({ currentNeeds, followupContent, recentFollo
       ],
       { maxTokens: 2048, timeoutMs: 30000 } // 30s：容忍网络波动；仍低于前端 60s 超时，不会造成保存假失败，超时按无冲突跳过
     );
+    console.log(`${tag} 模型原始返回：${JSON.stringify(String(content || '')).slice(0, 400)}`);
     const parsed = extractJson(content);
-    if (!parsed || typeof parsed !== 'object') return null;
-    if (parsed.conflict !== true) return { conflict: false, newNeeds: '', reason: String(parsed.reason || '') };
+    if (!parsed || typeof parsed !== 'object') { console.warn(`${tag} ✗ 返回内容解析不出 JSON，按无冲突处理`); return null; }
+    if (parsed.conflict !== true) { console.log(`${tag} 判定：不变更（${String(parsed.reason || '模型未给出理由')}）`); return { conflict: false, newNeeds: '', reason: String(parsed.reason || '') }; }
     const newNeeds = String(parsed.new_needs || '').trim();
     // 新需求为空/超长/与原需求完全相同 → 结论无效，按无冲突处理
-    if (!newNeeds || newNeeds.length > 2000 || newNeeds === currentNeeds) return null;
+    if (!newNeeds || newNeeds.length > 2000 || newNeeds === currentNeeds) { console.warn(`${tag} ✗ conflict=true 但 new_needs 无效（空/超长/与原需求相同），按无冲突处理`); return null; }
+    console.log(`${tag} 判定：需求变更 → ${JSON.stringify(newNeeds.slice(0, 150))}`);
     return { conflict: true, newNeeds, reason: String(parsed.reason || '').trim() };
-  } catch (_) {
+  } catch (e) {
+    console.warn(`${tag} ✗ 分析异常：${e.message}`);
     return null;
   }
 }

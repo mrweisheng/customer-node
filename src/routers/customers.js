@@ -727,14 +727,18 @@ router.post('/:customer_id/followups', authRequired, adminReadOnly, (req, res, n
           currentNeeds: customer.current_needs || '',
           followupContent: content,
           recentFollowups: prevFollowups,
+          logCtx: `客户${customerId}`,
         });
         if (analysis && analysis.conflict) {
+          console.log(`[需求分析] 客户${customerId} 跟进触发：需求已更新`);
           db.prepare('UPDATE customers SET current_needs = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
             .run(analysis.newNeeds, customerId);
           db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
             .run(customerId, req.user.id, `需求已随跟进自动更新：${analysis.newNeeds}`);
+        } else {
+          console.log(`[需求分析] 客户${customerId} 跟进触发：需求无变更（${analysis ? analysis.reason : '分析失败/结论无效'}）`);
         }
-      } catch (_) { /* 静默：分析失败不影响任何已保存数据 */ }
+      } catch (e) { console.error(`[需求分析] 客户${customerId} 分析异常：${e.message}`); }
     })();
     res.json({ code: 0, msg: '跟进记录已保存' });
   } catch (e) { next(e); }
@@ -801,14 +805,18 @@ router.post('/:customer_id/visits', authRequired, adminReadOnly, (req, res, next
           currentNeeds: customer.current_needs || '',
           followupContent: needs,
           recentFollowups: prevFollowups,
+          logCtx: `客户${customerId}`,
         });
         if (analysis && analysis.conflict) {
+          console.log(`[需求分析] 客户${customerId} 到店触发：需求已更新`);
           db.prepare('UPDATE customers SET current_needs = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
             .run(analysis.newNeeds, customerId);
           db.prepare('INSERT INTO customer_followups (customer_id, user_id, content) VALUES (?, ?, ?)')
             .run(customerId, req.user.id, `需求已自动更新：${analysis.newNeeds}`);
+        } else {
+          console.log(`[需求分析] 客户${customerId} 到店触发：需求无变更（${analysis ? analysis.reason : '分析失败/结论无效'}）`);
         }
-      } catch (_) { /* 静默：分析失败不影响任何已保存数据 */ }
+      } catch (e) { console.error(`[需求分析] 客户${customerId} 分析异常：${e.message}`); }
     })();
     res.json({ code: 0, msg: '到店已记录，已自动标为重点客户', visit_id: visitId });
   } catch (e) { next(e); }
