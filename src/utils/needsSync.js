@@ -29,7 +29,7 @@ async function analyzeNeedsConflict({ currentNeeds, followupContent, recentFollo
           content: `当前需求：${currentNeeds ? String(currentNeeds).slice(0, 500) : '（空）'}\n新跟进：${String(followupContent).slice(0, 500)}${recentText}`,
         },
       ],
-      { maxTokens: 2048, timeoutMs: 10000 } // 短超时：AI 卡死也不能拖住跟进保存请求（前端 60s 会先超时造成假失败）
+      { maxTokens: 2048, timeoutMs: 30000 } // 30s：容忍网络波动；仍低于前端 60s 超时，不会造成保存假失败，超时按无冲突跳过
     );
     const parsed = extractJson(content);
     if (!parsed || typeof parsed !== 'object') return null;
