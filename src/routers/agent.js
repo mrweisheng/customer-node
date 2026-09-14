@@ -25,7 +25,9 @@ function checkRateLimit(userId) {
   rateLimitStore.set(userId, arr);
 }
 // ── POST /chat（SSE）──────────────────────────────────────
-// 请求体：{ messages: OpenAI 格式[], image_base64?: string }
+// 请求体：{ messages: OpenAI 格式[], images_base64?: string[] }（兼容旧 image_base64 单图）
+// 单次最多 9 张，超过直接 422
+const MAX_IMAGES = 9;
 // SSE 事件：text_delta / tool_call / pending_import / tool_result / done / error
 router.post('/chat', authRequired, async (req, res, next) => {
   // ── 前置校验：全部在开 SSE 之前完成，失败走正常 HTTP 状态码 ──
@@ -38,11 +40,16 @@ router.post('/chat', authRequired, async (req, res, next) => {
     return next(httpError(403, '管理员账号仅可查看，不支持录入'));
   }
   const userMessages = Array.isArray((req.body || {}).messages) ? req.body.messages : [];
-  const pendingImage = (req.body || {}).image_base64 || null;
+  const pendingImages = Array.isArray((req.body || {}).images_base64)
+    ? (req.body || {}).images_base64.filter((b) => typeof b === 'string' && b.length > 0)
+    : ((req.body || {}).image_base64 ? [(req.body || {}).image_base64] : []);
   if (userMessages.length > 200) {
     return next(httpError(422, 'messages 长度不能超过 200'));
   }
-  if (pendingImage) {
+  if (pendingImages.length > MAX_IMAGES) {
+    return next(httpError(422, `单次最多识别 ${MAX_IMAGES} 张图片`));
+  }
+  for (const pendingImage of pendingImages) {
     const buf = Buffer.from(pendingImage, 'base64');
     if (buf.length > 5 * 1024 * 1024) return next(httpError(422, '图片大小不能超过 5MB'));
     const isJpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
@@ -57,16 +64,16 @@ router.post('/chat', authRequired, async (req, res, next) => {
     if (!['user', 'assistant', 'tool'].includes(m.role)) continue;
     messages.push(m);
   }
-  if (pendingImage) {
+  if (pendingImages.length > 0) {
     const last = messages[messages.length - 1];
     // 前端支持只发图不打字（拖拽/回车直发），空文本时兜底默认识别指令
     const text = (last && last.role === 'user' && typeof last.content === 'string' && last.content.trim())
       ? last.content
-      : '请识别这张截图中的联系人';
+      : '请识别这些截图中的联系人';
     const userMsg = {
       role: 'user',
       content: [
-        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${pendingImage}` } },
+        ...pendingImages.map((base64) => ({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } })),
         { type: 'text', text },
       ],
     };
