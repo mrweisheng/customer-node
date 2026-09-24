@@ -405,12 +405,13 @@ router.get('/deal-stats', authRequired, (req, res, next) => {
     const uf = buildUserFilter(req.user, targetUserId);
     const clause = uf.clause;   // customer_deals 表自带 user_id，可直接套用
 
-    // 总览：成交单数、成交客户数(去重)、车辆/两地牌单数
+    // 总览：成交单数、成交客户数(去重)、车辆/两地牌/综合业务单数
     const ov = db.prepare(
       `SELECT COUNT(*) AS total_count,
               COUNT(DISTINCT customer_id) AS customer_count,
               SUM(CASE WHEN deal_type='vehicle' THEN 1 ELSE 0 END) AS vehicle_count,
-              SUM(CASE WHEN deal_type='plate' THEN 1 ELSE 0 END) AS plate_count
+              SUM(CASE WHEN deal_type='plate' THEN 1 ELSE 0 END) AS plate_count,
+              SUM(CASE WHEN deal_type='comprehensive' THEN 1 ELSE 0 END) AS comprehensive_count
        FROM customer_deals WHERE ${clause}`
     ).get(...uf.params);
 
@@ -469,6 +470,7 @@ router.get('/deal-stats', authRequired, (req, res, next) => {
       customer_count: ov.customer_count,
       vehicle_count: ov.vehicle_count || 0,
       plate_count: ov.plate_count || 0,
+      comprehensive_count: ov.comprehensive_count || 0,
       month_count: m.c,
       monthly: { months, counts },
       by_port,
@@ -909,11 +911,11 @@ router.get('/:customer_id/deals', authRequired, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// 成交字段校验（vehicle/plate 公用）
+// 成交字段校验（vehicle/plate/comprehensive 公用）
 function validateDealBody(b) {
   const dealType = b.deal_type;
-  if (!['vehicle', 'plate'].includes(dealType)) {
-    throw httpError(422, "deal_type 必须为 'vehicle' 或 'plate'");
+  if (!['vehicle', 'plate', 'comprehensive'].includes(dealType)) {
+    throw httpError(422, "deal_type 必须为 'vehicle'、'plate' 或 'comprehensive'");
   }
   if (dealType === 'vehicle' && !(b.vin && String(b.vin).trim()) && !(b.vehicle_desc && String(b.vehicle_desc).trim())) {
     throw httpError(422, '车辆成交需填写车架号或车辆描述');
@@ -921,13 +923,16 @@ function validateDealBody(b) {
   if (dealType === 'plate' && !(b.port && String(b.port).trim())) {
     throw httpError(422, '两地牌成交需选择口岸');
   }
+  if (dealType === 'comprehensive' && !(b.vehicle_desc && String(b.vehicle_desc).trim())) {
+    throw httpError(422, '综合业务成交需填写业务描述');
+  }
   return {
     deal_type: dealType,
     deal_time: normalizeDealTime(b.deal_time),
     amount: normalizeAmount(b.amount),
-    // 按 deal_type 只保留对应类型字段，另一类型字段强制清空，避免切换类型残留脏数据
+    // 按 deal_type 只保留对应类型字段，其他类型字段强制清空，避免切换类型残留脏数据
     vin: dealType === 'vehicle' ? (b.vin || null) : null,
-    vehicle_desc: dealType === 'vehicle' ? (b.vehicle_desc || null) : null,
+    vehicle_desc: (dealType === 'vehicle' || dealType === 'comprehensive') ? (b.vehicle_desc || null) : null,
     port: dealType === 'plate' ? (b.port || null) : null,
     plate_kind: dealType === 'plate' ? (b.plate_kind || null) : null,
     plate_number: dealType === 'plate' ? (b.plate_number || null) : null,

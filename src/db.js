@@ -47,16 +47,18 @@ CREATE INDEX IF NOT EXISTS ix_customers_lead_date ON customers(lead_date);
 CREATE INDEX IF NOT EXISTS ix_customers_is_priority ON customers(is_priority);
 
 -- 成交记录（扁平单表：每条为一个成交项；既买车又办牌=两条；分次成交=不同 deal_time 两条）
+-- deal_type: 'vehicle'(车辆) | 'plate'(两地牌) | 'comprehensive'(综合业务，如香港驾照/上牌/代办等)
+-- 综合业务的内容用 vehicle_desc 字段存「一句话描述」，其余专用字段为 NULL
 CREATE TABLE IF NOT EXISTS customer_deals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   customer_id INTEGER NOT NULL REFERENCES customers(id),
   user_id INTEGER NOT NULL REFERENCES users(id),
-  deal_type TEXT NOT NULL CHECK(deal_type IN ('vehicle','plate')),  -- 车辆 / 两地牌
+  deal_type TEXT NOT NULL CHECK(deal_type IN ('vehicle','plate','comprehensive')),
   deal_time TEXT,        -- 成交时间 YYYY-MM-DD
   amount REAL,           -- 成交金额
   -- 车辆成交专用(deal_type='vehicle')
   vin TEXT,              -- 车架号
-  vehicle_desc TEXT,     -- 车辆描述(车型/颜色等,无 VIN 时填此项)
+  vehicle_desc TEXT,     -- 车辆描述(车型/颜色等,无 VIN 时填此项)；综合业务时存业务描述
   -- 两地牌专用(deal_type='plate')
   port TEXT,             -- 口岸(深圳湾/莲塘/沙头角/港珠澳)
   plate_kind TEXT,       -- 期牌 / 现牌
@@ -113,6 +115,48 @@ CREATE INDEX IF NOT EXISTS idx_visits_is_deal ON customer_visits(is_deal);
 const customerCols = db.pragma('table_info(customers)');
 if (!customerCols.some((c) => c.name === 'current_needs')) {
   db.exec('ALTER TABLE customers ADD COLUMN current_needs TEXT');
+}
+
+// ── 幂等迁移：customer_deals 支持综合业务成交类型 ──────────────────
+// 历史库 CHECK 约束只允许 ('vehicle','plate')；SQLite 不支持 ALTER CHECK，
+// 按 12-step 重建表（rename → 建新表 → 拷数据 → 删旧表 → 重建索引）。
+// CREATE TABLE IF NOT EXISTS 不会改旧表 CHECK，所以需要主动检测并迁移。
+const dealSql = db
+  .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='customer_deals'")
+  .get()?.sql || '';
+if (dealSql && !/comprehensive/.test(dealSql)) {
+  console.log('[db] 迁移 customer_deals：放宽 deal_type CHECK 以支持综合业务');
+  db.exec(`
+    ALTER TABLE customer_deals RENAME TO customer_deals_old;
+    CREATE TABLE customer_deals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_id INTEGER NOT NULL REFERENCES customers(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      deal_type TEXT NOT NULL CHECK(deal_type IN ('vehicle','plate','comprehensive')),
+      deal_time TEXT,
+      amount REAL,
+      vin TEXT,
+      vehicle_desc TEXT,
+      port TEXT,
+      plate_kind TEXT,
+      plate_number TEXT,
+      remark TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO customer_deals
+      (id, customer_id, user_id, deal_type, deal_time, amount,
+       vin, vehicle_desc, port, plate_kind, plate_number, remark,
+       created_at, updated_at)
+      SELECT id, customer_id, user_id, deal_type, deal_time, amount,
+             vin, vehicle_desc, port, plate_kind, plate_number, remark,
+             created_at, updated_at
+      FROM customer_deals_old;
+    DROP TABLE customer_deals_old;
+    CREATE INDEX idx_deals_customer ON customer_deals(customer_id);
+    CREATE INDEX idx_deals_user ON customer_deals(user_id);
+    CREATE INDEX idx_deals_type ON customer_deals(deal_type);
+  `);
 }
 
 module.exports = db;

@@ -47,7 +47,7 @@ function serializeDeal(d) {
   return {
     id: d.id,
     customer_id: d.customer_id,
-    deal_type: d.deal_type,        // 'vehicle' | 'plate'
+    deal_type: d.deal_type,        // 'vehicle' | 'plate' | 'comprehensive'
     deal_time: formatDate(d.deal_time),
     amount: d.amount === null || d.amount === undefined ? null : Number(d.amount),
     vin: d.vin ?? null,
