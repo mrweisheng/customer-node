@@ -409,7 +409,8 @@ router.get('/users/list', authRequired, (req, res, next) => {
 //       老值空 → inserted / 新值非空 → updated（刷 updated_at）
 //       老值非空 + 新值空/相同 → skipped（updated_at 不刷，避免污染最近接触时间）
 //   - 错误响应统一 { error, field?, index? }，不回显具体入参
-// 归属 system user（db.getSystemUserId），与 sales 线索在数据上分桶
+// 归属固定账号：第三方导入统一写到 user 14（明哥兩地牌HK（助理））名下，
+// 与页面操作的数据同桶，命中 (user_id, lead_date, customer_name) 即更新、不重复建行
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 function isValidYmd(s) {
   const m = DATE_RE.exec(s);
@@ -468,11 +469,14 @@ const upsertLead = db.prepare(`
 
 const BATCH_MAX = 500;
 
+// 第三方导入固定归属账号（user 14 = 明哥兩地牌HK（助理））；换归属只改这里
+const LEAD_OWNER_USER_ID = 14;
+
 router.post('/lead', (req, res) => {
   try {
     const b = req.body || {};
-    const userId = db.getSystemUserId();
-    console.log('[lead-debug] req.body=', JSON.stringify(b), 'systemUserId=', userId);
+    const userId = LEAD_OWNER_USER_ID;
+    console.log('[lead-debug] req.body=', JSON.stringify(b), 'leadOwnerUserId=', userId);
 
     // 头像字段携带诊断：customer_avatar_url 是否真的传了、传的什么（字段名不一致是丢头像最常见原因）
     const leadItems = Array.isArray(b.leads) ? b.leads : [b];
