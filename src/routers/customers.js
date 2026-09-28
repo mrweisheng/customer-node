@@ -472,6 +472,27 @@ router.post('/lead', (req, res) => {
   try {
     const b = req.body || {};
     const userId = db.getSystemUserId();
+    console.log('[lead-debug] req.body=', JSON.stringify(b), 'systemUserId=', userId);
+
+    // 头像字段携带诊断：customer_avatar_url 是否真的传了、传的什么（字段名不一致是丢头像最常见原因）
+    const leadItems = Array.isArray(b.leads) ? b.leads : [b];
+    leadItems.forEach((it, i) => {
+      const tag = Array.isArray(b.leads) ? `#${i}` : 'single';
+      const hasKey = it && typeof it === 'object' && Object.prototype.hasOwnProperty.call(it, 'customer_avatar_url');
+      const raw = hasKey ? it.customer_avatar_url : undefined;
+      if (!hasKey || raw === undefined || raw === null) {
+        const aliases = it && typeof it === 'object'
+          ? Object.keys(it).filter((k) => k !== 'customer_avatar_url' && /avatar|head|img|photo|portrait/i.test(k)) : [];
+        console.log(`[lead-debug] ${tag} 头像诊断：customer_avatar_url 未携带 → 按空串入库` +
+          (aliases.length ? `；发现疑似头像别名键：${aliases.join(',')}（字段名不一致！）` : ''));
+      } else if (typeof raw !== 'string') {
+        console.log(`[lead-debug] ${tag} 头像诊断：类型为 ${typeof raw} → 422 拒绝`);
+      } else {
+        const t = raw.trim();
+        const protoOk = /^https?:\/\//i.test(t);
+        console.log(`[lead-debug] ${tag} 头像诊断：收到 "${t}"（长度${t.length}，协议${protoOk ? '合法' : '非法→422拒绝'}）`);
+      }
+    });
 
     // ── 批量模式：body 含数组 leads ─────────────────
     if (Array.isArray(b.leads)) {
@@ -483,10 +504,12 @@ router.post('/lead', (req, res) => {
       for (let i = 0; i < leads.length; i++) {
         const v = validateLeadInput(leads[i] || {});
         if (!v.ok) {
+          console.log('[lead-debug] batch validate FAIL index=', i, 'field=', v.field);
           return res.status(422).json({ error: 'invalid_input', field: v.field, index: i });
         }
         validated.push(v.value);
       }
+      console.log('[lead-debug] batch validated=', JSON.stringify(validated));
 
       // 事务前查老 URL：用于判定 inserted/updated/skipped
       // （key = lead_date + customer_name；user_id 在事务内一致）
@@ -500,30 +523,52 @@ router.post('/lead', (req, res) => {
       for (const r of existing) {
         oldUrlByKey.set(`${r.lead_date}|${r.customer_name}`, r.customer_avatar_url || '');
       }
+      console.log('[lead-debug] batch existing=', JSON.stringify(existing));
 
+      const selectAfter = db.prepare(
+        'SELECT id, user_id, customer_avatar_url FROM customers WHERE user_id=? AND lead_date=? AND customer_name=?'
+      );
       const results = [];
       const tx = db.transaction(() => {
         for (let i = 0; i < validated.length; i++) {
           const v = validated[i];
-          const row = upsertLead.get(userId, v.leadDate, v.name, v.avatarUrl);
           const oldUrl = oldUrlByKey.get(`${v.leadDate}|${v.name}`);
+          const row = upsertLead.get(userId, v.leadDate, v.name, v.avatarUrl);
+          const dbRow = selectAfter.get(userId, v.leadDate, v.name);
           let action;
           if (oldUrl === undefined) action = 'inserted';
           else if (v.avatarUrl && v.avatarUrl !== oldUrl) action = 'updated';
           else action = 'skipped';
+          console.log('[lead-debug] batch i=', i,
+            'input.avatarUrl=', JSON.stringify(v.avatarUrl),
+            'oldUrl=', JSON.stringify(oldUrl),
+            'dbRow=', JSON.stringify(dbRow),
+            '→ action=', action);
           results.push({ index: i, id: row?.id ?? null, action });
         }
       });
       tx();
+      console.log('[lead-debug] batch 出参=', JSON.stringify({ results }));
       return res.json({ results });
     }
 
     // ── 单条模式（保持原行为）─────────────────────
     const v = validateLeadInput(b);
     if (!v.ok) {
+      console.log('[lead-debug] single validate FAIL field=', v.field);
       return res.status(422).json({ error: 'invalid_input', field: v.field });
     }
+    console.log('[lead-debug] single validated=', JSON.stringify(v.value));
+    const oldRow = db.prepare(
+      'SELECT customer_avatar_url FROM customers WHERE user_id=? AND lead_date=? AND customer_name=?'
+    ).get(userId, v.value.leadDate, v.value.name);
+    console.log('[lead-debug] single existing=', JSON.stringify(oldRow || null));
     const row = upsertLead.get(userId, v.value.leadDate, v.value.name, v.value.avatarUrl);
+    const dbRow = db.prepare(
+      'SELECT id, user_id, customer_avatar_url FROM customers WHERE user_id=? AND lead_date=? AND customer_name=?'
+    ).get(userId, v.value.leadDate, v.value.name);
+    console.log('[lead-debug] single after upsert dbRow=', JSON.stringify(dbRow));
+    console.log('[lead-debug] single 出参=', JSON.stringify({ ok: true, id: row?.id ?? null }));
     return res.json({ ok: true, id: row?.id ?? null });
   } catch (e) {
     console.error('[customers/lead]', e.message);
