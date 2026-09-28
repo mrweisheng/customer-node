@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS customers (
   customer_name TEXT NOT NULL,
   is_priority INTEGER DEFAULT 0,
   remark TEXT,
+  customer_avatar_url TEXT DEFAULT '',
   last_visit_at TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -117,6 +118,12 @@ if (!customerCols.some((c) => c.name === 'current_needs')) {
   db.exec('ALTER TABLE customers ADD COLUMN current_needs TEXT');
 }
 
+// ── 幂等迁移：customers.customer_avatar_url（线索级头像 URL）──
+// 默认空串 = 不展示外部头像；新录入接口 POST /customers/lead 接受可选头像链接
+if (!customerCols.some((c) => c.name === 'customer_avatar_url')) {
+  db.exec("ALTER TABLE customers ADD COLUMN customer_avatar_url TEXT DEFAULT ''");
+}
+
 // ── 幂等迁移：customer_deals 支持综合业务成交类型 ──────────────────
 // 历史库 CHECK 约束只允许 ('vehicle','plate')；SQLite 不支持 ALTER CHECK，
 // 按 12-step 重建表（rename → 建新表 → 拷数据 → 删旧表 → 重建索引）。
@@ -158,5 +165,29 @@ if (dealSql && !/comprehensive/.test(dealSql)) {
     CREATE INDEX idx_deals_type ON customer_deals(deal_type);
   `);
 }
+
+// ── 内部 API 系统用户 ────────────────────────────────────────
+// 内部同步接口（如 POST /customers/lead）无登录态，所有线索统一挂在这个
+// system 用户名下；openid 是固定魔法值便于幂等 seed；role='system' 区分 admin/user
+const SYSTEM_USER_OPENID = 'internal_system';
+let cachedSystemUserId = null;
+function getSystemUserId() {
+  if (cachedSystemUserId) return cachedSystemUserId;
+  let row = db.prepare('SELECT id FROM users WHERE openid = ?').get(SYSTEM_USER_OPENID);
+  if (row) { cachedSystemUserId = row.id; return cachedSystemUserId; }
+  try {
+    const info = db.prepare(
+      "INSERT INTO users (openid, role, nickname) VALUES (?, 'system', '内部线索同步')"
+    ).run(SYSTEM_USER_OPENID);
+    cachedSystemUserId = info.lastInsertRowid;
+  } catch (e) {
+    // 并发首次 seed（多副本启动时）：其他副本已 INSERT，重新 SELECT 拿 id
+    row = db.prepare('SELECT id FROM users WHERE openid = ?').get(SYSTEM_USER_OPENID);
+    if (row) cachedSystemUserId = row.id;
+    else throw e;
+  }
+  return cachedSystemUserId;
+}
+db.getSystemUserId = getSystemUserId;
 
 module.exports = db;

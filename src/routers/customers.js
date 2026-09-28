@@ -397,6 +397,92 @@ router.get('/users/list', authRequired, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── POST /lead ──────────────────────────────────────────
+// 内部线索录入（不需 token、不需登录校验；网络层保证只在内网访问）
+//   - lead_date / customer_name / customer_avatar_url 严格校验（类型 + 格式 + 长度）
+//   - 命中 (user_id, lead_date, customer_name) 唯一索引 → 按 customer_avatar_url 决定是否更新：
+//       老值空 → 直接 UPDATE 为新 URL
+//       老值非空 + 新值非空 + 不相等 → UPDATE 为新 URL（同步刷新 updated_at）
+//       其余情况 → 保留原值
+//   - 错误响应统一返回 { error, field? }，不回显具体入参；避免泄漏内部信息
+//   - 高并发：单条 INSERT ... ON CONFLICT 原子化，不依赖应用层查重
+// 归属 system 用户（db.getSystemUserId），与 sales 线索在数据上分桶
+const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+function isValidYmd(s) {
+  const m = DATE_RE.exec(s);
+  if (!m) return false;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+router.post('/lead', (req, res) => {
+  try {
+    const b = req.body || {};
+
+    // lead_date：必须是字符串且是真实存在的日期（拒 2026-13-45 这种）
+    if (typeof b.lead_date !== 'string' || !isValidYmd(b.lead_date)) {
+      return res.status(422).json({ error: 'invalid_input', field: 'lead_date' });
+    }
+    const leadDate = b.lead_date;
+
+    // customer_name：trim 后 1-200 字符；非字符串直接拒
+    if (typeof b.customer_name !== 'string') {
+      return res.status(422).json({ error: 'invalid_input', field: 'customer_name' });
+    }
+    const name = b.customer_name.trim();
+    if (name.length < 1 || name.length > 200) {
+      return res.status(422).json({ error: 'invalid_input', field: 'customer_name' });
+    }
+
+    // customer_avatar_url：可选；非空时必须 http(s) 且 ≤1000 字符
+    let avatarUrl = '';
+    if (b.customer_avatar_url !== undefined && b.customer_avatar_url !== null) {
+      if (typeof b.customer_avatar_url !== 'string') {
+        return res.status(422).json({ error: 'invalid_input', field: 'customer_avatar_url' });
+      }
+      avatarUrl = b.customer_avatar_url.trim();
+      if (avatarUrl.length > 1000) {
+        return res.status(422).json({ error: 'invalid_input', field: 'customer_avatar_url' });
+      }
+      if (avatarUrl && !/^https?:\/\//i.test(avatarUrl)) {
+        return res.status(422).json({ error: 'invalid_input', field: 'customer_avatar_url' });
+      }
+    }
+
+    const userId = db.getSystemUserId();
+
+    // SQLite UPSERT：原子处理「插入 vs 按规则更新头像」
+    // 命中 (user_id, lead_date, customer_name) 唯一索引时：
+    //   - 新 URL 非空且与旧不同 → 更新 customer_avatar_url + updated_at
+    //   - 其他情况              → 保留原值（updated_at 也不刷，避免污染最近接触时间）
+    const row = db.prepare(`
+      INSERT INTO customers
+        (user_id, lead_date, customer_name, customer_avatar_url, is_priority, remark)
+      VALUES (?, ?, ?, ?, 0, NULL)
+      ON CONFLICT(user_id, lead_date, customer_name) DO UPDATE SET
+        customer_avatar_url = CASE
+          WHEN excluded.customer_avatar_url != '' AND excluded.customer_avatar_url != customer_avatar_url
+            THEN excluded.customer_avatar_url
+          ELSE customer_avatar_url
+        END,
+        updated_at = CASE
+          WHEN excluded.customer_avatar_url != '' AND excluded.customer_avatar_url != customer_avatar_url
+            THEN CURRENT_TIMESTAMP
+          ELSE updated_at
+        END
+      RETURNING id
+    `).get(userId, leadDate, name, avatarUrl);
+
+    // 成功响应：不回显具体入参，仅给 ok + 行 id
+    res.json({ ok: true, id: row?.id ?? null });
+  } catch (e) {
+    // 内部错误：通用 500，不回显堆栈/字段值；细节走服务端日志
+    console.error('[customers/lead]', e.message);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ── GET /deal-stats ────────────────────────────────────
 // 成交统计：总览(客户数/单数，不含金额) + 近6月单数趋势 + 口岸分布 + 期现牌 + 最近10条
 router.get('/deal-stats', authRequired, (req, res, next) => {
