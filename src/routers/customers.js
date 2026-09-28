@@ -399,14 +399,17 @@ router.get('/users/list', authRequired, (req, res, next) => {
 
 // ── POST /lead ──────────────────────────────────────────
 // 内部线索录入（不需 token、不需登录校验；网络层保证只在内网访问）
-//   - lead_date / customer_name / customer_avatar_url 严格校验（类型 + 格式 + 长度）
-//   - 命中 (user_id, lead_date, customer_name) 唯一索引 → 按 customer_avatar_url 决定是否更新：
-//       老值空 → 直接 UPDATE 为新 URL
-//       老值非空 + 新值非空 + 不相等 → UPDATE 为新 URL（同步刷新 updated_at）
-//       其余情况 → 保留原值
-//   - 错误响应统一返回 { error, field? }，不回显具体入参；避免泄漏内部信息
-//   - 高并发：单条 INSERT ... ON CONFLICT 原子化，不依赖应用层查重
-// 归属 system 用户（db.getSystemUserId），与 sales 线索在数据上分桶
+//   支持两种入参形态：
+//     单条：{ lead_date, customer_name, customer_avatar_url? }   → { ok, id }
+//     批量：{ leads: [ { lead_date, customer_name, customer_avatar_url? }, ... ] }
+//           → { results: [ { index, id, action: 'inserted'|'updated'|'skipped' } ] }
+//   - 每条都做严格校验（类型 + 真实日期 + 长度 + URL 协议）；任一失败整批拒
+//   - 批量上限 500 条/请求；超出 → 422
+//   - 命中 (user_id, lead_date, customer_name) 唯一索引时按 customer_avatar_url 决定：
+//       老值空 → inserted / 新值非空 → updated（刷 updated_at）
+//       老值非空 + 新值空/相同 → skipped（updated_at 不刷，避免污染最近接触时间）
+//   - 错误响应统一 { error, field?, index? }，不回显具体入参
+// 归属 system user（db.getSystemUserId），与 sales 线索在数据上分桶
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 function isValidYmd(s) {
   const m = DATE_RE.exec(s);
@@ -416,68 +419,113 @@ function isValidYmd(s) {
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
 }
 
+// 单条入参校验：返回 { ok:false, field } 或 { ok:true, value:{ leadDate, name, avatarUrl } }
+function validateLeadInput(b) {
+  if (typeof b.lead_date !== 'string' || !isValidYmd(b.lead_date)) {
+    return { ok: false, field: 'lead_date' };
+  }
+  if (typeof b.customer_name !== 'string') {
+    return { ok: false, field: 'customer_name' };
+  }
+  const name = b.customer_name.trim();
+  if (name.length < 1 || name.length > 200) {
+    return { ok: false, field: 'customer_name' };
+  }
+  let avatarUrl = '';
+  if (b.customer_avatar_url !== undefined && b.customer_avatar_url !== null) {
+    if (typeof b.customer_avatar_url !== 'string') {
+      return { ok: false, field: 'customer_avatar_url' };
+    }
+    avatarUrl = b.customer_avatar_url.trim();
+    if (avatarUrl.length > 1000) {
+      return { ok: false, field: 'customer_avatar_url' };
+    }
+    if (avatarUrl && !/^https?:\/\//i.test(avatarUrl)) {
+      return { ok: false, field: 'customer_avatar_url' };
+    }
+  }
+  return { ok: true, value: { leadDate: b.lead_date, name, avatarUrl } };
+}
+
+// 复用 UPSERT prepared statement（prepared 一次，事务内多次执行）
+const upsertLead = db.prepare(`
+  INSERT INTO customers
+    (user_id, lead_date, customer_name, customer_avatar_url, is_priority, remark)
+  VALUES (?, ?, ?, ?, 0, NULL)
+  ON CONFLICT(user_id, lead_date, customer_name) DO UPDATE SET
+    customer_avatar_url = CASE
+      WHEN excluded.customer_avatar_url != '' AND excluded.customer_avatar_url != customer_avatar_url
+        THEN excluded.customer_avatar_url
+      ELSE customer_avatar_url
+    END,
+    updated_at = CASE
+      WHEN excluded.customer_avatar_url != '' AND excluded.customer_avatar_url != customer_avatar_url
+        THEN CURRENT_TIMESTAMP
+      ELSE updated_at
+    END
+  RETURNING id
+`);
+
+const BATCH_MAX = 500;
+
 router.post('/lead', (req, res) => {
   try {
     const b = req.body || {};
-
-    // lead_date：必须是字符串且是真实存在的日期（拒 2026-13-45 这种）
-    if (typeof b.lead_date !== 'string' || !isValidYmd(b.lead_date)) {
-      return res.status(422).json({ error: 'invalid_input', field: 'lead_date' });
-    }
-    const leadDate = b.lead_date;
-
-    // customer_name：trim 后 1-200 字符；非字符串直接拒
-    if (typeof b.customer_name !== 'string') {
-      return res.status(422).json({ error: 'invalid_input', field: 'customer_name' });
-    }
-    const name = b.customer_name.trim();
-    if (name.length < 1 || name.length > 200) {
-      return res.status(422).json({ error: 'invalid_input', field: 'customer_name' });
-    }
-
-    // customer_avatar_url：可选；非空时必须 http(s) 且 ≤1000 字符
-    let avatarUrl = '';
-    if (b.customer_avatar_url !== undefined && b.customer_avatar_url !== null) {
-      if (typeof b.customer_avatar_url !== 'string') {
-        return res.status(422).json({ error: 'invalid_input', field: 'customer_avatar_url' });
-      }
-      avatarUrl = b.customer_avatar_url.trim();
-      if (avatarUrl.length > 1000) {
-        return res.status(422).json({ error: 'invalid_input', field: 'customer_avatar_url' });
-      }
-      if (avatarUrl && !/^https?:\/\//i.test(avatarUrl)) {
-        return res.status(422).json({ error: 'invalid_input', field: 'customer_avatar_url' });
-      }
-    }
-
     const userId = db.getSystemUserId();
 
-    // SQLite UPSERT：原子处理「插入 vs 按规则更新头像」
-    // 命中 (user_id, lead_date, customer_name) 唯一索引时：
-    //   - 新 URL 非空且与旧不同 → 更新 customer_avatar_url + updated_at
-    //   - 其他情况              → 保留原值（updated_at 也不刷，避免污染最近接触时间）
-    const row = db.prepare(`
-      INSERT INTO customers
-        (user_id, lead_date, customer_name, customer_avatar_url, is_priority, remark)
-      VALUES (?, ?, ?, ?, 0, NULL)
-      ON CONFLICT(user_id, lead_date, customer_name) DO UPDATE SET
-        customer_avatar_url = CASE
-          WHEN excluded.customer_avatar_url != '' AND excluded.customer_avatar_url != customer_avatar_url
-            THEN excluded.customer_avatar_url
-          ELSE customer_avatar_url
-        END,
-        updated_at = CASE
-          WHEN excluded.customer_avatar_url != '' AND excluded.customer_avatar_url != customer_avatar_url
-            THEN CURRENT_TIMESTAMP
-          ELSE updated_at
-        END
-      RETURNING id
-    `).get(userId, leadDate, name, avatarUrl);
+    // ── 批量模式：body 含数组 leads ─────────────────
+    if (Array.isArray(b.leads)) {
+      const leads = b.leads;
+      if (leads.length < 1 || leads.length > BATCH_MAX) {
+        return res.status(422).json({ error: 'invalid_input', field: 'leads' });
+      }
+      const validated = [];
+      for (let i = 0; i < leads.length; i++) {
+        const v = validateLeadInput(leads[i] || {});
+        if (!v.ok) {
+          return res.status(422).json({ error: 'invalid_input', field: v.field, index: i });
+        }
+        validated.push(v.value);
+      }
 
-    // 成功响应：不回显具体入参，仅给 ok + 行 id
-    res.json({ ok: true, id: row?.id ?? null });
+      // 事务前查老 URL：用于判定 inserted/updated/skipped
+      // （key = lead_date + customer_name；user_id 在事务内一致）
+      const placeholders = validated.map(() => '(?,?,?)').join(',');
+      const params = validated.flatMap((v) => [userId, v.leadDate, v.name]);
+      const existing = db.prepare(
+        `SELECT lead_date, customer_name, customer_avatar_url
+         FROM customers WHERE (user_id, lead_date, customer_name) IN (${placeholders})`
+      ).all(...params);
+      const oldUrlByKey = new Map();
+      for (const r of existing) {
+        oldUrlByKey.set(`${r.lead_date}|${r.customer_name}`, r.customer_avatar_url || '');
+      }
+
+      const results = [];
+      const tx = db.transaction(() => {
+        for (let i = 0; i < validated.length; i++) {
+          const v = validated[i];
+          const row = upsertLead.get(userId, v.leadDate, v.name, v.avatarUrl);
+          const oldUrl = oldUrlByKey.get(`${v.leadDate}|${v.name}`);
+          let action;
+          if (oldUrl === undefined) action = 'inserted';
+          else if (v.avatarUrl && v.avatarUrl !== oldUrl) action = 'updated';
+          else action = 'skipped';
+          results.push({ index: i, id: row?.id ?? null, action });
+        }
+      });
+      tx();
+      return res.json({ results });
+    }
+
+    // ── 单条模式（保持原行为）─────────────────────
+    const v = validateLeadInput(b);
+    if (!v.ok) {
+      return res.status(422).json({ error: 'invalid_input', field: v.field });
+    }
+    const row = upsertLead.get(userId, v.value.leadDate, v.value.name, v.value.avatarUrl);
+    return res.json({ ok: true, id: row?.id ?? null });
   } catch (e) {
-    // 内部错误：通用 500，不回显堆栈/字段值；细节走服务端日志
     console.error('[customers/lead]', e.message);
     res.status(500).json({ error: 'internal_error' });
   }
