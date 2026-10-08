@@ -200,6 +200,43 @@ router.get('/trend', authRequired, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── GET /daily-additions ───────────────────────────────
+// 每日新增名单：按 lead_date 分组返回最近 N 天（含今天，口径同 /calendar）
+// 每天给 数量 + 客户名单，前端以「日期短码/姓名」格式展示（同工作台列表）
+router.get('/daily-additions', authRequired, (req, res, next) => {
+  try {
+    const targetUserId = optInt(req.query.target_user_id);
+    const uf = buildUserFilter(req.user, targetUserId);
+    let days = parseInt(req.query.days, 10);
+    if (Number.isNaN(days)) days = 7;
+    days = Math.min(90, Math.max(1, days));
+
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const startDate = addDays(today, -(days - 1));
+
+    const rows = db.prepare(
+      `SELECT id, lead_date, customer_name FROM customers
+       WHERE ${uf.clause} AND lead_date >= ? AND lead_date <= ?
+       ORDER BY lead_date DESC, created_at DESC`
+    ).all(...uf.params, ymd(startDate), ymd(today));
+
+    const byDate = new Map(); // rows 已按 lead_date 倒序，Map 保持插入序即日期倒序
+    for (const r of rows) {
+      if (!byDate.has(r.lead_date)) byDate.set(r.lead_date, []);
+      byDate.get(r.lead_date).push({ id: r.id, lead_date: r.lead_date, customer_name: r.customer_name });
+    }
+
+    const items = [];
+    let total = 0;
+    for (const [date, customers] of byDate) {
+      total += customers.length;
+      items.push({ date: md(new Date(date + 'T00:00:00')), date_full: date, count: customers.length, customers });
+    }
+
+    res.json({ days, total, items });
+  } catch (e) { next(e); }
+});
+
 // ── GET /latest ────────────────────────────────────────
 router.get('/latest', authRequired, (req, res, next) => {
   try {
