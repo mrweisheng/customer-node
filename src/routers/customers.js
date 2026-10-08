@@ -365,21 +365,22 @@ router.get('/calendar', authRequired, (req, res, next) => {
     const monthStart = `${year}-${pad(month)}-01`;
     const monthEnd = `${year}-${pad(month)}-${pad(lastDay)}`;
     const rows = db.prepare(
-      `SELECT DISTINCT lead_date FROM customers
-       WHERE ${uf.clause} AND lead_date >= ? AND lead_date <= ?`
+      `SELECT lead_date, COUNT(*) AS c FROM customers
+       WHERE ${uf.clause} AND lead_date >= ? AND lead_date <= ?
+       GROUP BY lead_date`
     ).all(...uf.params, monthStart, monthEnd);
-    const active = new Set(rows.map((r) => r.lead_date));
+    const active = new Map(rows.map((r) => [r.lead_date, r.c]));
 
     const days = [];
     let updatedCount = 0, missedCount = 0;
     for (let dayNum = 1; dayNum <= lastDay; dayNum++) {
       const dStr = `${year}-${pad(month)}-${pad(dayNum)}`;
       const d = new Date(dStr + 'T00:00:00');
-      let status;
+      let status, count = 0;
       if (d > today) status = 'future';
-      else if (active.has(dStr)) { status = 'updated'; updatedCount++; }
+      else if (active.has(dStr)) { status = 'updated'; updatedCount++; count = active.get(dStr); }
       else { status = 'missed'; missedCount++; }
-      days.push({ day: dayNum, status });
+      days.push({ day: dayNum, status, count });
     }
     const totalDays = updatedCount + missedCount;
     const updateRate = totalDays > 0 ? Math.round((updatedCount / totalDays) * 1000) / 10 : 0.0;
